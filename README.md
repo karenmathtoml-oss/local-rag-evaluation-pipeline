@@ -104,4 +104,4 @@ python bench.py --llm qwen3:1.7b
 
 ## ライセンス
 
-未設定です。
+[MIT License](LICENSE)
