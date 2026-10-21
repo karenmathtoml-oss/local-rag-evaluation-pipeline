@@ -56,8 +56,6 @@ class Generator(Protocol):
     def generate(self, query: str, chunks: list[Chunk]) -> str: ...
 
 
-# ---- 分割 ----------------------------------------------------------------
-
 def parse_sections(md: str) -> list[Chunk]:
     """`## 見出し {#id}` の節を1チャンクにする。`###` 以下は親の本文に含める。"""
     chunks: list[Chunk] = []
@@ -102,8 +100,6 @@ def fixed_chunks(md: str, size: int = 200) -> list[Chunk]:
     ]
 
 
-# ---- 検索 ----------------------------------------------------------------
-
 def bigrams(text: str) -> list[str]:
     s = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text).lower())
     return [s[i:i + 2] for i in range(len(s) - 1)] or ([s] if s else [])
@@ -123,16 +119,15 @@ class MarkdownRetriever:
 
     def search(self, query: str, k: int | None = None) -> list[tuple[Chunk, float]]:
         terms = set(bigrams(query))
-        scored = []
-        for c, tf, dl in zip(self.chunks, self.tfs, self.lens):
-            norm = self.k1 * (1 - self.b + self.b * dl / self.avgdl)
-            s = sum(self.idf[t] * tf[t] * (self.k1 + 1) / (tf[t] + norm) for t in terms if t in tf)
-            scored.append((c, s))
-        scored.sort(key=lambda x: -x[1])  # 同点は元の順(安定ソート)
+        k1, b = self.k1, self.b
+        scored = [
+            (c, sum(self.idf[t] * tf[t] * (k1 + 1) / (tf[t] + k1 * (1 - b + b * dl / self.avgdl))
+                    for t in terms if t in tf))
+            for c, tf, dl in zip(self.chunks, self.tfs, self.lens)
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)  # 同点は元の順(安定ソート)
         return scored[:k] if k else scored
 
-
-# ---- ルーター --------------------------------------------------------------
 
 class QueryRouter:
     """挨拶、お礼、自己紹介、計算式は "direct"。それ以外は "search"。"""
@@ -147,8 +142,6 @@ class QueryRouter:
         q = unicodedata.normalize("NFKC", query).strip()
         return "direct" if any(p.search(q) for p in self.DIRECT) else "search"
 
-
-# ---- 生成 ----------------------------------------------------------------
 
 OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
 
@@ -186,18 +179,16 @@ INSTRUCTION = (
 )
 
 
-def build_prompt(query: str, chunks: list[Chunk]) -> str:
-    """固定の指示を先頭に、毎回変わる部分を後ろに置く。"""
-    context = "\n\n".join(f"[{c.id}] {c.title}\n{c.text}" for c in chunks)
-    return f"{INSTRUCTION}\n<context>\n{context}\n</context>\n質問: {query}"
-
-
 class OllamaGenerator:
     def __init__(self, model: str, timeout: float = 120):
         self.model, self.timeout = model, timeout
 
     def generate(self, query: str, chunks: list[Chunk]) -> str:
-        prompt = build_prompt(query, chunks) if chunks else query
+        prompt = query
+        if chunks:
+            # 固定の指示を先頭に、毎回変わる部分を後ろに置く
+            context = "\n\n".join(f"[{c.id}] {c.title}\n{c.text}" for c in chunks)
+            prompt = f"{INSTRUCTION}\n<context>\n{context}\n</context>\n質問: {query}"
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -216,13 +207,10 @@ class OllamaGenerator:
         return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
-# ---- エージェント ------------------------------------------------------------
-
 class RAGAgent:
-    def __init__(self, retriever: Retriever, generator: Generator,
-                 router: QueryRouter | None = None, k: int = TOP_K, tau: float = TAU):
-        self.retriever, self.generator = retriever, generator
-        self.router, self.k, self.tau = router or QueryRouter(), k, tau
+    def __init__(self, retriever: Retriever, generator: Generator, k: int = TOP_K, tau: float = TAU):
+        self.retriever, self.generator, self.k, self.tau = retriever, generator, k, tau
+        self.router = QueryRouter()
 
     def answer(self, query: str) -> Answer:
         route = self.router.route(query)
@@ -237,20 +225,15 @@ class RAGAgent:
         return Answer(text, route, [c.id for c, _ in hits], (t1 - t0) * 1e3, (t2 - t1) * 1e3)
 
 
-def build_agent(note: str | Path = "mock.md", chunker: Chunker = parse_sections,
-                generator: Generator | None = None) -> RAGAgent:
-    chunks = chunker(Path(note).read_text(encoding="utf-8"))
-    return RAGAgent(MarkdownRetriever(chunks), generator or ExtractiveGenerator())
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description="ノートに対して1問だけ質問する")
     p.add_argument("query")
     p.add_argument("--note", default=Path(__file__).with_name("mock.md"))
     p.add_argument("--llm", metavar="MODEL", help="Ollamaのモデル名(例: qwen3:1.7b)。省略時は抽出型")
     args = p.parse_args()
-    agent = build_agent(args.note, generator=OllamaGenerator(args.llm) if args.llm else None)
-    a = agent.answer(args.query)
+    chunks = parse_sections(Path(args.note).read_text(encoding="utf-8"))
+    generator = OllamaGenerator(args.llm) if args.llm else ExtractiveGenerator()
+    a = RAGAgent(MarkdownRetriever(chunks), generator).answer(args.query)
     print(f"route : {a.route}")
     print(f"chunks: {', '.join(a.chunk_ids) or '-'}")
     print(f"answer: {a.text}")

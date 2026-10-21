@@ -13,7 +13,6 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from rag_agent import (
     NOT_FOUND, TOP_K, Chunker, ExtractiveGenerator, Generator, MarkdownRetriever,
@@ -46,20 +45,17 @@ RETRIEVAL_TYPES = ("exact", "paraphrase")
 class Condition:
     label: str
     chunker: Chunker
-    generator: Callable[[], Generator]
-
-
-def norm(s: str) -> str:
-    return unicodedata.normalize("NFKC", s).lower()
+    generator: Generator
 
 
 def keyword_coverage(answer: str, keywords: list[str]) -> float:
-    return sum(norm(k) in norm(answer) for k in keywords) / len(keywords)
+    answer = unicodedata.normalize("NFKC", answer).lower()
+    return sum(unicodedata.normalize("NFKC", k).lower() in answer for k in keywords) / len(keywords)
 
 
 def evaluate(cond: Condition, md: str, cases: list[dict]) -> tuple[dict, list[dict]]:
     retriever = MarkdownRetriever(cond.chunker(md))
-    agent = RAGAgent(retriever, cond.generator())
+    agent = RAGAgent(retriever, cond.generator)
     rows = []
     for c in cases:
         a = agent.answer(c["query"])
@@ -76,11 +72,11 @@ def evaluate(cond: Condition, md: str, cases: list[dict]) -> tuple[dict, list[di
     ret = [r for r in rows if r["type"] in RETRIEVAL_TYPES]
     una = [r for r in rows if r["type"] == "unanswerable"]
     metrics = {
-        "Hit@3": float(statistics.mean(r["rank"] is not None and r["rank"] <= TOP_K for r in ret)),
-        "MRR": statistics.mean(1 / r["rank"] if r["rank"] else 0.0 for r in ret),
-        "Coverage": statistics.mean(r["coverage"] for r in ret),
-        "Routing": float(statistics.mean(r["route_ok"] for r in rows)),
-        "Unans.": float(statistics.mean(NOT_FOUND in r["answer"] for r in una)),
+        "Hit@3": statistics.fmean(r["rank"] is not None and r["rank"] <= TOP_K for r in ret),
+        "MRR": statistics.fmean(1 / r["rank"] if r["rank"] else 0.0 for r in ret),
+        "Coverage": statistics.fmean(r["coverage"] for r in ret),
+        "Routing": statistics.fmean(r["route_ok"] for r in rows),
+        "Unans.": statistics.fmean(NOT_FOUND in r["answer"] for r in una),
         "検索ms": latency([r["t_retrieve"] for r in rows]),
         "生成ms": latency([r["t_generate"] for r in rows]),
     }
@@ -92,9 +88,9 @@ def latency(ms: list[float]) -> str:
 
 
 def table(header: list[str], rows: list[list]) -> str:
-    fmt = lambda v: f"{v:.2f}" if isinstance(v, float) else str(v)
-    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
-    return "\n".join(lines + ["| " + " | ".join(fmt(v) for v in r) + " |" for r in rows])
+    cells = [header] + [[f"{v:.2f}" if isinstance(v, float) else str(v) for v in r] for r in rows]
+    lines = ["| " + " | ".join(r) + " |" for r in cells]
+    return "\n".join([lines[0], "|" + "---|" * len(header), *lines[1:]])
 
 
 def main() -> None:
@@ -107,12 +103,11 @@ def main() -> None:
 
     md = Path(args.note).read_text(encoding="utf-8")
     conditions = [
-        Condition("見出し分割 + 抽出", parse_sections, ExtractiveGenerator),
-        Condition("固定長200字 + 抽出", fixed_chunks, ExtractiveGenerator),
+        Condition("見出し分割 + 抽出", parse_sections, ExtractiveGenerator()),
+        Condition("固定長200字 + 抽出", fixed_chunks, ExtractiveGenerator()),
     ]
     if args.llm:
-        conditions.append(Condition(f"見出し分割 + LLM({args.llm})", parse_sections,
-                                    lambda: OllamaGenerator(args.llm)))
+        conditions.append(Condition(f"見出し分割 + LLM({args.llm})", parse_sections, OllamaGenerator(args.llm)))
 
     results = [(c.label, *evaluate(c, md, CASES)) for c in conditions]
     header = ["条件", *results[0][1]]
