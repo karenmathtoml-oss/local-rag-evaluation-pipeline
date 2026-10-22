@@ -1,0 +1,13 @@
+[
+  {"id": "V01", "type": "paraphrase", "query": "倉庫のリーダーの名前は?", "route": "search", "gold": ["sec_contacts"], "keywords": ["湯浅"]},
+  {"id": "V02", "type": "paraphrase", "query": "木の板を注文してから手元に来るまで、ふだん何日かかる?", "route": "search", "gold": ["sec_order_out"], "keywords": ["10営業日"]},
+  {"id": "V03", "type": "paraphrase", "query": "この会社の従業員は何人?", "route": "search", "gold": ["sec_overview"], "keywords": ["18人"]},
+  {"id": "V04", "type": "paraphrase", "query": "ギフト用の包み紙はどこにしまってある?", "route": "search", "gold": ["sec_client_b"], "keywords": ["2階"]},
+  {"id": "V05", "type": "paraphrase", "query": "戻ってきた品物の状態を確かめる職人は誰?", "route": "search", "gold": ["sec_returns"], "keywords": ["大庭"]},
+  {"id": "V06", "type": "paraphrase", "query": "販売管理のソフトは使い始めて何年たつ?", "route": "search", "gold": ["sec_systems"], "keywords": ["9年"]},
+  {"id": "V07", "type": "paraphrase", "query": "在庫の数え上げ作業は、いつごろ片付く?", "route": "search", "gold": ["sec_inventory"], "keywords": ["18時"]},
+  {"id": "V08", "type": "paraphrase", "query": "仕入れ値を下げてもらう話し合いは、誰が担当する?", "route": "search", "gold": ["sec_order_out"], "keywords": ["三ツ木"]},
+  {"id": "W01", "type": "unanswerable", "query": "湯浅さんの携帯の番号は?", "route": "search"},
+  {"id": "W02", "type": "unanswerable", "query": "大庭さんは職人になって何年?", "route": "search"},
+  {"id": "W03", "type": "unanswerable", "query": "ネットショップの1か月の売上はいくら?", "route": "search"}
+]

@@ -14,6 +14,16 @@ model = "qwen3:1.7b"
 base_url = "http://127.0.0.1:11434"
 think = false
 
+# 同じモデルの思考モード版。言い換えの読み取りに効くが、生成は2.5〜9倍遅い(CPUの場合)。使うときは enabled = true にする
+[[models]]
+name = "qwen3-1.7b-think"
+backend = "ollama"
+model = "qwen3:1.7b"
+base_url = "http://127.0.0.1:11434"
+think = true
+options = { max_tokens = 1024, timeout = 300 }   # 思考の分のトークンも上限に数えられるため
+enabled = false
+
 [[models]]
 name = "gemma3-1b"
 backend = "ollama"

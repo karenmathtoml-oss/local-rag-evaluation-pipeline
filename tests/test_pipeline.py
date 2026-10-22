@@ -211,6 +211,11 @@ class PipelineTest(unittest.TestCase):
     def test_repo_cases_are_scorable(self):
         self.assertEqual(len(CASES), 28)
 
+    def test_dev_cases_do_not_overlap_test_cases(self):
+        dev = load_cases(ROOT / "cases_dev.json", CHUNKS)
+        self.assertEqual(len(dev), 11)
+        self.assertFalse({c["query"] for c in dev} & {c["query"] for c in CASES})
+
     # ---- 分割
 
     def test_parse_errors(self):

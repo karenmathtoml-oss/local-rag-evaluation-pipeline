@@ -123,6 +123,7 @@ def main() -> None:
     p.add_argument("--conditions", help=f"カンマ区切りで {' / '.join(CONDITIONS)}。省略時は settings.toml の値")
     p.add_argument("--check", action="store_true", help="モデルが入っているかを確かめるだけ")
     p.add_argument("--detail", action="store_true", help="1問ごとの結果も出す")
+    p.add_argument("--cases", help="試験のファイル(例: cases_dev.json)。省略時は settings.toml の bench.cases")
     p.add_argument("--settings", default=ROOT / "settings.toml")
     p.add_argument("--models-file", default=ROOT / "models.toml")
     args = p.parse_args()
@@ -143,7 +144,7 @@ def main() -> None:
 
     # 推論の前に、ノートと試験の誤りを見つける
     chunks = parse_sections((ROOT / settings["bench"]["note"]).read_text(encoding="utf-8"))
-    cases = load_cases(ROOT / settings["bench"]["cases"], chunks)
+    cases = load_cases(args.cases or ROOT / settings["bench"]["cases"], chunks)
 
     clients = [make_client(s, settings["generation"]) for s in specs]
     missing = []
