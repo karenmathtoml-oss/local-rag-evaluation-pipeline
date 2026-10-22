@@ -1,8 +1,8 @@
 """見出し単位の分割と文字2-gramのBM25による、依存なしの最小RAGエージェント。
 
 部品(分割・検索・ルーター・生成)は差し替えられるように、小さなインターフェースで繋ぐ。
-    python rag_agent.py "研究室ミーティングは何曜日?"
-    python rag_agent.py "研究室ミーティングは何曜日?" --llm qwen3:1.7b
+    python rag_agent.py "受注番号はどんな形式?"
+    python rag_agent.py "受注番号はどんな形式?" --llm qwen3:1.7b
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from typing import Callable, Protocol
 
 NOT_FOUND = "ノートに記載がありません"
 # 検索の最高点がこれ未満なら、答えずに NOT_FOUND を返す。bench.py の試験データを見て1度だけ決めた値。
-TAU = 5.5
+TAU = 6.5
 TOP_K = 3
 
 H2 = re.compile(r"^##\s")
