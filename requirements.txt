@@ -1,3 +1,3 @@
-# 実行時の依存はありません(Python 3.10以上の標準ライブラリのみ)。
-# LLMによる生成を試す場合だけ、Ollama(https://ollama.com)をローカルで起動してください。
-# 例: ollama pull qwen3:1.7b && python bench.py --llm qwen3:1.7b
+# 実行時の依存はありません(Python 3.11以上の標準ライブラリのみ。TOMLの読み込みに tomllib を使う)。
+# 評価するモデルは、ローカルのサーバ(Ollama、または OpenAI互換の llama.cpp、LM Studio、vLLM など)で動かし、models.toml に書きます。
+# 例: ollama pull qwen3:1.7b && python bench.py --check

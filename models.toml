@@ -1,0 +1,27 @@
+# 評価するモデルの一覧。入れたモデルを [[models]] で足し、enabled = false で一時的に外せる。
+#
+#   name     : 表に出す名前(重複不可)
+#   backend  : "ollama"(/api/chat)か "openai"(OpenAI互換の /v1/chat/completions。llama.cpp、LM Studio、vLLM など)
+#   model    : サーバ側のモデル名
+#   base_url : サーバのURL(/v1 は付けない)。ノートを外に出さないよう、127.0.0.1、localhost、::1 に限る
+#   think    : 任意。Ollamaの思考モードの切り替え(qwen3 など)。書かなければ送らない
+#   options  : 任意。settings.toml の [generation] をこのモデルだけ上書きする。例: options = { max_tokens = 512 }
+
+[[models]]
+name = "qwen3-1.7b"
+backend = "ollama"
+model = "qwen3:1.7b"
+base_url = "http://127.0.0.1:11434"
+think = false
+
+[[models]]
+name = "gemma3-1b"
+backend = "ollama"
+model = "gemma3:1b"
+base_url = "http://127.0.0.1:11434"
+
+[[models]]
+name = "llama3.2-3b"
+backend = "ollama"
+model = "llama3.2:3b"
+base_url = "http://127.0.0.1:11434"
