@@ -1,9 +1,3 @@
-"""models.toml のモデルを、settings.toml の条件で比べる。
-
-    python bench.py --check                      # モデルが入っているかを確かめるだけ
-    python bench.py                              # 有効なモデル × 条件をすべて回す
-    python bench.py --models qwen3-1.7b --conditions rag,oracle --detail
-"""
 from __future__ import annotations
 
 import argparse
