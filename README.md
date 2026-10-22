@@ -1,12 +1,12 @@
 # local-rag-evaluation-pipeline
 
-1つのMarkdownノートに対して、検索・振り分け・生成を通しで動かし、**検索と生成を別々に測る**ための最小のRAGエージェント評価基盤です。
-依存はなく(Python 3.10以上の標準ライブラリのみ)、`git clone` した直後に `python bench.py` で評価の表が出ます。
+Markdownノートをデータソースとして、検索・振り分け・生成を評価するための最小のRAGエージェント評価基盤です。
+`git clone` した直後に `python bench.py` で評価の表が出ます。
 
 ## 構成
 
 ```text
-├── mock.md          # 評価用のノート(`## 見出し {#sec_xxx}` の形でIDつき)
+├── mock.md          # 評価用のノート
 ├── rag_agent.py     # 分割、検索、ルーター、生成、エージェント、CLI
 ├── bench.py         # 試験10件、6つの指標、条件の比較、Markdownの表の出力
 └── requirements.txt # 依存なし(Ollamaは任意)
