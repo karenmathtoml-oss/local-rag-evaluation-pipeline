@@ -11,10 +11,11 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from bench import load_cases, norm, score, summarize
+from bench import agent_summary, load_cases, norm, score, summarize
 from bench import run as bench_run
 from models import load_models, make_client
-from rag_agent import ROOT, MarkdownRetriever, RAGAgent, build_prompt, load_settings, parse_sections
+from rag_agent import (LIMIT_MESSAGE, ROOT, MarkdownRetriever, RAGAgent, ToolAgent, build_prompt, load_settings,
+                       parse_sections)
 
 SETTINGS = load_settings(ROOT / "settings.toml")
 CHUNKS = parse_sections((ROOT / "mock.md").read_text(encoding="utf-8"))
@@ -27,6 +28,8 @@ class FakeServer(BaseHTTPRequestHandler):
     requests: list[dict] = []
     reply = "テストの回答"
     models = ["fake:1b"]
+    capabilities = ["completion", "tools"]
+    script: list[dict] = []  # 空でなければ、先頭から順に返す。{"content": ..., "calls": [(name, arguments), ...]}
 
     def _send(self, body: dict) -> None:
         data = json.dumps(body).encode()
@@ -44,12 +47,25 @@ class FakeServer(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/show":
+            return self._send({"capabilities": self.capabilities})
         FakeServer.requests.append({"path": self.path, "body": body})
-        text = f"<think>考え中</think>{self.reply}"
+        step = FakeServer.script.pop(0) if FakeServer.script else {"content": self.reply}
+        text = f"<think>考え中</think>{step.get('content', '')}"
+        calls = step.get("calls", [])
         if self.path == "/api/chat":
-            self._send({"message": {"role": "assistant", "content": text}})
+            message = {"role": "assistant", "content": text}
+            if calls:
+                message["tool_calls"] = [{"function": {"name": n, "arguments": a}} for n, a in calls]
+            self._send({"message": message, "done_reason": "stop", "prompt_eval_count": 100})
         else:
-            self._send({"choices": [{"message": {"role": "assistant", "content": text}}]})
+            message = {"role": "assistant", "content": text}
+            if calls:
+                message["tool_calls"] = [{"id": f"call_{i}", "type": "function",
+                                          "function": {"name": n, "arguments": a if isinstance(a, str) else json.dumps(a)}}
+                                         for i, (n, a) in enumerate(calls)]
+            self._send({"choices": [{"message": message, "finish_reason": "tool_calls" if calls else "stop"}],
+                        "usage": {"prompt_tokens": 100}})
 
     def log_message(self, *args):
         pass
@@ -74,6 +90,8 @@ class PipelineTest(unittest.TestCase):
     def setUp(self):
         FakeServer.requests.clear()
         FakeServer.reply = "テストの回答"
+        FakeServer.script = []
+        FakeServer.capabilities = ["completion", "tools"]
 
     def models_file(self, body: str) -> Path:
         d = tempfile.mkdtemp()
@@ -99,7 +117,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(text, "テストの回答")  # <think> は取り除く
         self.assertIs(body["think"], False)
         self.assertNotIn("think", body["options"])
-        self.assertEqual(set(body["options"]), {"temperature", "num_predict", "seed"})
+        self.assertEqual(set(body["options"]), {"temperature", "num_predict", "seed", "num_ctx"})
+        self.assertEqual(body["options"]["num_ctx"], SETTINGS["generation"]["num_ctx"])
 
     def test_ollama_omits_think_when_unset(self):
         self.client().generate("質問")
@@ -215,6 +234,77 @@ class PipelineTest(unittest.TestCase):
         dev = load_cases(ROOT / "cases_dev.json", CHUNKS)
         self.assertEqual(len(dev), 11)
         self.assertFalse({c["query"] for c in dev} & {c["query"] for c in CASES})
+
+    # ---- 条件 agent
+
+    def test_agent_loop_ollama(self):
+        FakeServer.script = [{"calls": [("search", {"query": "こもれび商店 最低ロット"})]}, {"content": "12個からです"}]
+        a = ToolAgent(CHUNKS, self.client(), SETTINGS).answer("こもれび商店の最低ロットは何個?")
+        self.assertEqual(a.text, "12個からです")
+        self.assertEqual((len(a.searches), a.model_calls, a.hit_limit, a.bad_calls), (1, 2, False, 0))
+        self.assertIn("sec_client_b", a.searches[0]["ids"])
+        first, second = (r["body"] for r in FakeServer.requests)
+        self.assertEqual(first["tools"][0]["function"]["name"], "search")
+        self.assertEqual([m["role"] for m in second["messages"]], ["system", "user", "assistant", "tool"])
+        self.assertIn("tool_calls", second["messages"][2])
+        self.assertEqual(second["messages"][3]["tool_name"], "search")
+        self.assertIn("[sec_client_b]", second["messages"][3]["content"])
+
+    def test_agent_loop_openai(self):
+        FakeServer.script = [{"calls": [("search", {"query": "最低ロット"})]}, {"content": "12個"}]
+        a = ToolAgent(CHUNKS, self.client("openai"), SETTINGS).answer("こもれび商店の最低ロットは何個?")
+        self.assertEqual(a.text, "12個")
+        tool = FakeServer.requests[1]["body"]["messages"][3]
+        self.assertEqual((tool["role"], tool["tool_call_id"]), ("tool", "call_0"))
+        self.assertEqual(FakeServer.requests[1]["body"]["messages"][2]["tool_calls"][0]["id"], "call_0")
+
+    def test_agent_hit_limit_forces_final_answer_without_tools(self):
+        steps = SETTINGS["agent"]["max_steps"]
+        FakeServer.script = [{"calls": [("search", {"query": f"検索{i}"})]} for i in range(steps)] + [{"content": "最終"}]
+        a = ToolAgent(CHUNKS, self.client(), SETTINGS).answer("質問")
+        self.assertEqual((a.text, a.hit_limit, a.model_calls, len(a.searches)), ("最終", True, steps + 1, steps))
+        last = FakeServer.requests[-1]["body"]
+        self.assertNotIn("tools", last)
+        self.assertEqual(last["messages"][-1], {"role": "user", "content": LIMIT_MESSAGE})
+
+    def test_agent_counts_bad_calls_and_continues(self):
+        FakeServer.script = [{"calls": [("search", {"q": "x"}), ("open", {"query": "x"})]},
+                             {"calls": [("search", "{壊れたJSON")]},
+                             {"content": "答え"}]
+        a = ToolAgent(CHUNKS, self.client("openai"), SETTINGS).answer("質問")
+        self.assertEqual((a.text, a.bad_calls, a.searches, a.hit_limit), ("答え", 3, [], False))
+
+    def test_agent_counts_tool_call_written_as_text(self):
+        FakeServer.script = [{"content": '{"name": "search", "arguments": {"query": "x"}}'}, {"content": "答え"}]
+        a = ToolAgent(CHUNKS, self.client(), SETTINGS).answer("質問")
+        self.assertEqual((a.text, a.bad_calls, a.model_calls), ("答え", 1, 2))
+
+    def test_agent_tool_result_carries_not_found_rule(self):
+        FakeServer.script = [{"calls": [("search", {"query": "x"})]}, {"content": "答え"}]
+        ToolAgent(CHUNKS, self.client(), SETTINGS).answer("質問")
+        messages = FakeServer.requests[1]["body"]["messages"]
+        self.assertNotIn(SETTINGS["prompt"]["not_found"], messages[0]["content"])
+        self.assertIn(SETTINGS["prompt"]["not_found"], messages[3]["content"])
+
+    def test_supports_tools(self):
+        self.assertTrue(self.client().supports_tools())
+        FakeServer.capabilities = ["completion"]
+        self.assertFalse(self.client().supports_tools())
+
+    def test_agent_condition_and_summary(self):
+        FakeServer.script = [
+            {"content": "3000"},  # D02: 検索せずに答える
+            {"calls": [("search", {"query": "ひだまり雑貨 締め日"})]},  # M01: 2回検索する
+            {"calls": [("search", {"query": "請求書 発行 期限 営業日"})]},
+            {"content": "20日に締めて、3営業日以内に出します"},
+        ]
+        by_id = {c["id"]: c for c in CASES}
+        cases = [by_id["D02"], by_id["M01"]]
+        rows = run(self.client(), "agent", CHUNKS, cases, SETTINGS)
+        self.assertEqual([r["accuracy"] for r in rows], [1.0, 1.0])
+        self.assertIn("sec_client_a", rows[1]["chunk_ids"])
+        s = agent_summary(rows, cases)
+        self.assertEqual((s["平均検索回数"], s["余計な検索"], s["再検索(multihop)"], s["打ち切り"]), (1.0, 0.0, 1.0, 0.0))
 
     # ---- 分割
 

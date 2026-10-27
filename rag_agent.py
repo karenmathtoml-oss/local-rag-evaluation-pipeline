@@ -144,11 +144,14 @@ class SentenceExtractor:
         return out
 
 
+def format_chunks(chunks: list[Chunk]) -> str:
+    return "\n\n".join(f"[{c.id}] {c.title}\n{c.text}" for c in chunks)
+
+
 def build_prompt(prompts: dict, kind: str, question: str, chunks: list[Chunk] = ()) -> str:
     """kind は settings.toml の [prompt] のキー(with_context / closed / direct)。"""
-    context = "\n\n".join(f"[{c.id}] {c.title}\n{c.text}" for c in chunks)
     return string.Template(prompts[kind]).safe_substitute(
-        question=question, context=context, not_found=prompts["not_found"])
+        question=question, context=format_chunks(chunks), not_found=prompts["not_found"])
 
 
 class RAGAgent:
@@ -178,6 +181,85 @@ class RAGAgent:
         return Answer(text, route, [c.id for c in chunks], prompt, ms)
 
 
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": "社内ノートを検索し、関係の深い節を返す。",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "検索する言葉"}},
+            "required": ["query"],
+        },
+    },
+}
+LIMIT_MESSAGE = "検索はここまでです。これまでの検索結果だけを根拠に答えてください。"
+BAD_CALL_MESSAGE = "エラー: search を、引数 query(検索する言葉)を付けて呼んでください。"
+# 道具の呼び出しを、呼び出しの形式ではなく本文にJSONで書いてしまう失敗(小型モデルで起きる)
+TEXT_TOOL_CALL = re.compile(r'"name"\s*:\s*"search"')
+
+
+@dataclass
+class AgentAnswer:
+    text: str
+    searches: list[dict]  # {"query": 検索語, "ids": 返した節のID}
+    bad_calls: int
+    hit_limit: bool
+    model_calls: int
+    max_prompt_tokens: int | None
+    done_reason: str | None  # 最後の呼び出しの止まった理由
+    t_generate: float  # すべての呼び出しの合計(ミリ秒)
+
+
+class ToolAgent:
+    """検索の道具 search をモデルに渡し、何をいつ検索し、いつ答えるかをモデルに決めさせる。
+
+    検索するかどうかの判断も測る対象なので、ルーターは使わない。検索は rag と同じBM25・同じ件数。
+    """
+
+    def __init__(self, chunks: list[Chunk], client, settings: dict):
+        self.retriever, self.client = MarkdownRetriever(chunks), client
+        self.k, self.max_steps = settings["retrieval"]["top_k"], settings["agent"]["max_steps"]
+        prompts = settings["prompt"]
+        self.not_found = prompts["not_found"]
+        self.system = string.Template(prompts["agent_system"]).safe_substitute(not_found=self.not_found)
+        self.tool_result = string.Template(prompts["agent_tool_result"])
+
+    def answer(self, question: str) -> AgentAnswer:
+        messages = [{"role": "system", "content": self.system}, {"role": "user", "content": question}]
+        searches, bad_calls, turns = [], 0, []
+        for _ in range(self.max_steps):
+            turn = self.client.chat(messages, [SEARCH_TOOL])
+            turns.append(turn)
+            if not turn.tool_calls and TEXT_TOOL_CALL.search(turn.content):
+                bad_calls += 1
+                messages += [turn.message, {"role": "user", "content": BAD_CALL_MESSAGE}]
+                continue
+            if not turn.tool_calls:
+                return self._result(turn.content, searches, bad_calls, False, turns)
+            messages.append(turn.message)
+            for call in turn.tool_calls:
+                query = (call.args or {}).get("query") if call.name == "search" else None
+                if not isinstance(query, str) or not query.strip():
+                    bad_calls += 1
+                    messages.append(self.client.tool_message(call, BAD_CALL_MESSAGE))
+                    continue
+                chunks = [c for c, _ in self.retriever.search(query, self.k)]
+                searches.append({"query": query, "ids": [c.id for c in chunks]})
+                result = self.tool_result.safe_substitute(context=format_chunks(chunks), not_found=self.not_found)
+                messages.append(self.client.tool_message(call, result))
+        # 上限に達したら、道具を付けずに1回だけ答えさせる
+        messages.append({"role": "user", "content": LIMIT_MESSAGE})
+        turns.append(self.client.chat(messages))
+        return self._result(turns[-1].content, searches, bad_calls, True, turns)
+
+    @staticmethod
+    def _result(text: str, searches: list[dict], bad_calls: int, hit_limit: bool, turns: list) -> AgentAnswer:
+        tokens = [t.prompt_tokens for t in turns if t.prompt_tokens is not None]
+        return AgentAnswer(text, searches, bad_calls, hit_limit, len(turns), max(tokens, default=None),
+                           turns[-1].done_reason, sum(t.ms for t in turns))
+
+
 class PromptOnly:
     """モデルを呼ばずに、送るはずのプロンプトを返す(--model を省いたときの確認用)。"""
 
@@ -192,6 +274,7 @@ def main() -> None:
     p.add_argument("query")
     p.add_argument("--model", help="models.toml の name。省略すると、プロンプトを表示するだけ")
     p.add_argument("--extract", action="store_true", help="検索した節を、文の抽出で圧縮してから渡す")
+    p.add_argument("--agent", action="store_true", help="検索をモデルに任せる(--model が必要)")
     p.add_argument("--settings", default=ROOT / "settings.toml")
     p.add_argument("--models-file", default=ROOT / "models.toml")
     args = p.parse_args()
@@ -205,6 +288,15 @@ def main() -> None:
     else:
         generator = PromptOnly()
     chunks = parse_sections((ROOT / settings["bench"]["note"]).read_text(encoding="utf-8"))
+    if args.agent:
+        if not args.model:
+            p.error("--agent には --model が必要です")
+        a = ToolAgent(chunks, generator, settings).answer(args.query)
+        for s in a.searches:
+            print(f"search: {s['query']} -> {', '.join(s['ids'])}")
+        print(f"answer: {a.text}")
+        print(f"time  : {a.t_generate:.0f}ms(モデルの呼び出し {a.model_calls} 回{'、上限で打ち切り' if a.hit_limit else ''})")
+        return
     a = RAGAgent(chunks, generator, settings, extract=args.extract).answer(args.query)
     print(f"route : {a.route}")
     print(f"chunks: {', '.join(a.chunk_ids) or '-'}")

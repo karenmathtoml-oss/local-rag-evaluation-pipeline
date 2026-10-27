@@ -10,9 +10,9 @@ import unicodedata
 from pathlib import Path
 
 from models import Client, load_models, make_client
-from rag_agent import ROOT, Chunk, MarkdownRetriever, RAGAgent, load_settings, parse_sections
+from rag_agent import ROOT, Chunk, MarkdownRetriever, RAGAgent, ToolAgent, load_settings, parse_sections
 
-CONDITIONS = ("closed", "rag", "rag_extract", "oracle")
+CONDITIONS = ("closed", "rag", "rag_extract", "oracle", "agent")
 TYPES = ("exact", "paraphrase", "multihop", "update", "direct", "unanswerable", "injection")
 
 
@@ -62,17 +62,24 @@ def oracle_chunks(case: dict, by_id: dict[str, Chunk], retriever: MarkdownRetrie
 
 def run(client: Client, condition: str, chunks: list[Chunk], cases: list[dict], settings: dict, log=None) -> list[dict]:
     agent = RAGAgent(chunks, client, settings, extract=condition == "rag_extract")
+    tool_agent = ToolAgent(chunks, client, settings) if condition == "agent" else None
     by_id = {c.id: c for c in chunks}
     rows = []
     for i, c in enumerate(cases, 1):
         print(f"\r{client.spec.name} / {condition}: {i}/{len(cases)}", end="", file=sys.stderr, flush=True)
-        if condition == "oracle":
-            a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
+        if tool_agent:
+            a = tool_agent.answer(c["query"])
+            extra = {"route": "agent", "chunk_ids": list(dict.fromkeys(x for s in a.searches for x in s["ids"])),
+                     "called": True, "searches": a.searches, "bad_calls": a.bad_calls, "hit_limit": a.hit_limit,
+                     "model_calls": a.model_calls, "max_prompt_tokens": a.max_prompt_tokens, "done_reason": a.done_reason}
         else:
-            a = agent.answer(c["query"], closed=condition == "closed")
-        row = {"model": client.spec.name, "condition": condition, "id": c["id"], "type": c["type"],
-               "route": a.route, "chunk_ids": a.chunk_ids, "answer": a.text, "called": a.prompt is not None,
-               "t_generate": a.t_generate, **score(c, a.text, settings["prompt"]["not_found"])}
+            if condition == "oracle":
+                a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
+            else:
+                a = agent.answer(c["query"], closed=condition == "closed")
+            extra = {"route": a.route, "chunk_ids": a.chunk_ids, "called": a.prompt is not None}
+        row = {"model": client.spec.name, "condition": condition, "id": c["id"], "type": c["type"], **extra,
+               "answer": a.text, "t_generate": a.t_generate, **score(c, a.text, settings["prompt"]["not_found"])}
         rows.append(row)
         if log:
             log.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -95,6 +102,25 @@ def summarize(rows: list[dict]) -> dict:
         "Inject.": mean([not r["obeyed_injection"] for r in rows if r["type"] == "injection"]),
         "生成ms": f"{statistics.fmean(times):.0f} / {max(times):.0f}" if times else "-",
     }
+
+
+def agent_summary(rows: list[dict], cases: list[dict]) -> dict:
+    """条件 agent だけの、検索の判断の指標。検索の再現率は、表の前の rag の Hit@k と比べる。"""
+    gold = {c["id"]: c.get("gold", []) for c in cases}
+    return {
+        "検索の再現率": mean([set(gold[r["id"]]) <= set(r["chunk_ids"]) for r in rows if gold[r["id"]]]),
+        "平均検索回数": mean([len(r["searches"]) for r in rows]),
+        "余計な検索": mean([bool(r["searches"]) for r in rows if r["type"] == "direct"]),
+        "再検索(multihop)": mean([len(r["searches"]) >= 2 for r in rows if r["type"] == "multihop"]),
+        "打ち切り": mean([r["hit_limit"] for r in rows]),
+        "不正な呼び出し": mean([r["bad_calls"] > 0 for r in rows]),
+    }
+
+
+def context_cell(row: dict) -> str:
+    if row["condition"] == "agent":
+        return " / ".join(f"「{s['query']}」→{','.join(s['ids'])}" for s in row["searches"]) or "(検索なし)"
+    return ",".join(row["chunk_ids"]) or "-"
 
 
 def retrieval_premise(chunks: list[Chunk], cases: list[dict], k: int) -> str:
@@ -160,21 +186,35 @@ def main() -> None:
     if args.check or missing:
         sys.exit(1 if missing else 0)
 
+    pairs = [(c, cond) for c in clients for cond in conditions]
+    if "agent" in conditions:
+        for c in clients:
+            if not c.supports_tools():
+                print(f"{c.spec.name}: 道具の呼び出しに対応していないので、agent の条件は飛ばします", file=sys.stderr)
+                pairs = [(x, cond) for x, cond in pairs if not (x is c and cond == "agent")]
+
     out = ROOT / "results" / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     out.parent.mkdir(exist_ok=True)
     with out.open("w", encoding="utf-8") as log:
-        results = [(c, cond, run(c, cond, chunks, cases, settings, log)) for c in clients for cond in conditions]
+        results = [(c, cond, run(c, cond, chunks, cases, settings, log)) for c, cond in pairs]
+    if not results:
+        sys.exit("評価できる組み合わせがありません")
 
     print(retrieval_premise(chunks, cases, settings["retrieval"]["top_k"]) + "\n")
     summaries = [(c.spec.name, cond, summarize(rows)) for c, cond, rows in results]
     print(table(["モデル", "条件", *summaries[0][2]], [[m, cond, *s.values()] for m, cond, s in summaries]))
     print(f"\n生成msは「平均 / 最大」。生の結果: {out.relative_to(ROOT).as_posix()}")
 
+    agent_rows = [(c.spec.name, agent_summary(rows, cases)) for c, cond, rows in results if cond == "agent"]
+    if agent_rows:
+        print(f"\n### エージェントの検索(最大 {settings['agent']['max_steps']} 回)\n")
+        print(table(["モデル", *agent_rows[0][1]], [[m, *s.values()] for m, s in agent_rows]))
+
     if args.detail:
         for c, cond, rows in results:
             print(f"\n### {c.spec.name} / {cond}\n")
             print(table(["ID", "種類", "文脈", "Accuracy", "断った", "回答"], [
-                [r["id"], r["type"], ",".join(r["chunk_ids"]) or "-",
+                [r["id"], r["type"], context_cell(r).replace("|", "\\|"),
                  "-" if r["accuracy"] is None else r["accuracy"], "yes" if r["refused"] else "",
                  r["answer"].replace("\n", " ").replace("|", "\\|")[:60]]
                 for r in rows
