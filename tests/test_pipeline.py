@@ -11,7 +11,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from bench import context_warning, load_cases, norm, run_header, score, summarize
+from bench import context_warning, load_cases, norm, retrieval_metrics, run_header, score, summarize, warmup
 from bench import run as bench_run
 from models import load_models, make_client
 from rag_agent import ROOT, MarkdownRetriever, RAGAgent, build_prompt, load_settings, parse_sections
@@ -57,7 +57,8 @@ class FakeServer(BaseHTTPRequestHandler):
         text = f"<think>考え中</think>{self.reply}" if self.content is None else self.content
         if self.path == "/api/chat":
             self._send({"message": {"role": "assistant", "content": text}, "done_reason": self.done_reason,
-                        "prompt_eval_count": 1000, "eval_count": 20})
+                        "prompt_eval_count": 1000, "eval_count": 20,
+                        "load_duration": 5_000_000, "prompt_eval_duration": 2_000_000, "eval_duration": 40_000_000})
         else:
             self._send({"choices": [{"message": {"role": "assistant", "content": text},
                                      "finish_reason": self.done_reason}],
@@ -149,6 +150,19 @@ class PipelineTest(unittest.TestCase):
         self.assertTrue(rows[0]["truncated"])
         self.assertEqual(rows[0]["prompt_tokens"], 1000)
         self.assertEqual(summarize(rows)["切断"], 1)
+
+    def test_ollama_durations_in_ms(self):
+        _, _, meta = self.client().generate("質問")
+        self.assertEqual((meta["load_ms"], meta["prompt_eval_ms"], meta["eval_ms"]), (5.0, 2.0, 40.0))
+
+    def test_warmup_generates_one_token_and_restores_settings(self):
+        c = self.client()
+        w = warmup(c)
+        self.assertEqual((w["kind"], w["error"]), ("warmup", None))
+        self.assertEqual(FakeServer.requests[-1]["body"]["options"]["num_predict"], 1)
+        self.assertEqual(c.gen["max_tokens"], SETTINGS["generation"]["max_tokens"])
+        FakeServer.fail = True
+        self.assertIn("500", warmup(c)["error"])  # 失敗しても止めない
 
     def test_info(self):
         info = self.client().info()
@@ -265,10 +279,33 @@ class PipelineTest(unittest.TestCase):
     def test_unscorable_case_rejected_before_inference(self):
         path = Path(tempfile.mkdtemp()) / "cases.json"
         path.write_text(json.dumps([{"id": "X", "type": "exact", "query": "q", "route": "search"},
-                                    {"id": "Y", "type": "exact", "query": "q", "gold": ["sec_nope"], "keywords": ["a"]}]),
+                                    {"id": "Y", "type": "exact", "query": "q", "route": "search", "gold": ["sec_nope"],
+                                     "keywords": ["a"]}]),
                         encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "X: 採点できません(.|\n)*sec_nope"):
             load_cases(path, CHUNKS)
+
+    def test_case_file_mistakes_rejected(self):
+        ok = {"type": "exact", "query": "受注番号は?", "route": "search", "keywords": ["J-"]}
+        for cases, msg in (
+            ([{"id": "A", **ok}, {"id": "A", **ok}], "A: IDが重複"),
+            ([{"id": "A", **ok, "route": "direct"}], "A: route は direct ですが、ルーターは search"),
+            ([{"id": "A", "type": "exact", "keywords": ["x"]}], "A: query, route がありません"),
+        ):
+            with self.subTest(msg=msg):
+                path = Path(tempfile.mkdtemp()) / "cases.json"
+                path.write_text(json.dumps(cases, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, msg):
+                    load_cases(path, CHUNKS)
+
+    def test_retrieval_metrics(self):
+        m = retrieval_metrics(CHUNKS, CASES, 3)
+        self.assertEqual(m["n"], 21)
+        self.assertGreaterEqual(m["Hit@3"], m["Recall@3"])  # どれか1つ ≥ 割合 ≥ すべて
+        self.assertGreaterEqual(m["Recall@3"], m["All@3"])
+        # M02 は正解の節が1位と4位: どれかは入るが、すべては入らない
+        m02 = retrieval_metrics(CHUNKS, [c for c in CASES if c["id"] == "M02"], 3)
+        self.assertEqual((m02["Hit@3"], m02["Recall@3"], m02["All@3"], m02["MRR"]), (1.0, 0.5, 0.0, 1.0))
 
     def test_repo_cases_are_scorable(self):
         self.assertEqual(len(CASES), 28)
@@ -277,6 +314,7 @@ class PipelineTest(unittest.TestCase):
         dev = load_cases(ROOT / "cases_dev.json", CHUNKS)
         self.assertEqual(len(dev), 11)
         self.assertFalse({c["query"] for c in dev} & {c["query"] for c in CASES})
+        self.assertFalse({c["id"] for c in dev} & {c["id"] for c in CASES})
 
     # ---- 分割
 

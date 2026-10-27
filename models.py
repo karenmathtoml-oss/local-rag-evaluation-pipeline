@@ -82,6 +82,15 @@ class Client:
         meta.update(thinking=thinking or None, truncated=meta.get("stop") == "length" or unclosed)
         return THINK.sub("", text).strip(), ms, meta
 
+    def warmup(self) -> float:
+        """モデルをサーバに読み込ませる(1トークンだけ生成し、採点しない)。かかったmsを返す。
+        読み込みの時間が、1問目の生成msに入らないようにするため。"""
+        gen, self.gen = self.gen, {**self.gen, "max_tokens": 1}
+        try:
+            return self.generate("こんにちは")[1]
+        finally:
+            self.gen = gen
+
     def _chat(self, prompt: str) -> tuple[str, dict]:
         raise NotImplementedError
 
@@ -112,6 +121,8 @@ class OllamaClient(Client):
             "prompt_tokens": r.get("prompt_eval_count"),  # キャッシュが効くと、実際より少なく出る
             "output_tokens": r.get("eval_count"),
             "thinking": r["message"].get("thinking"),  # think = true のとき、content とは別に返る
+            # サーバが測った時間(ナノ秒をミリ秒に)。eval_count / eval_ms でトークン/秒が出せる
+            **{f"{k}_ms": r[f"{k}_duration"] / 1e6 for k in ("load", "prompt_eval", "eval") if f"{k}_duration" in r},
         }
 
     def _tag(self) -> dict | None:
