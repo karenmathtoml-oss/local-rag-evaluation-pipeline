@@ -113,14 +113,18 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(meta["thinking"], "考え中")
         self.assertIs(body["think"], False)
         self.assertNotIn("think", body["options"])
-        self.assertEqual(set(body["options"]), {"temperature", "num_predict", "seed", "num_ctx"})
+        self.assertEqual(set(body["options"]), {"temperature", "num_predict", "seed"})  # num_ctx は書いたときだけ
+
+    def test_ollama_sends_num_ctx_when_set(self):
+        self.client(extra="options = { num_ctx = 8192 }").generate("質問")
+        self.assertEqual(FakeServer.requests[-1]["body"]["options"]["num_ctx"], 8192)
 
     def test_ollama_omits_think_when_unset(self):
         self.client().generate("質問")
         self.assertNotIn("think", FakeServer.requests[-1]["body"])
 
     def test_openai_compat(self):
-        c = self.client("openai", 'options = { max_tokens = 64 }')
+        c = self.client("openai", 'options = { max_tokens = 64, num_ctx = 8192 }')
         text, _, meta = c.generate("質問")
         self.assertEqual(text, "テストの回答")
         self.assertEqual((meta["stop"], meta["prompt_tokens"], meta["truncated"]), ("stop", 1000, False))
