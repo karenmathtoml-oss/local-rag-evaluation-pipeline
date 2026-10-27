@@ -12,6 +12,7 @@ temperature = 0
 max_tokens = 256
 seed = 42
 timeout = 120          # 1回の生成を待つ秒数
+num_ctx = 4096         # Ollamaだけ。文脈長。省くとサーバの既定値(バージョンで違う)になり、超えたプロンプトは前から切り詰められる
 
 [prompt]
 # $question、$context、$not_found が置き換わる。題材(note)を変えたら、ここも合わせて書き換える。

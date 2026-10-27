@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
+import platform
 import re
 import statistics
+import subprocess
 import sys
 import time
 import unicodedata
@@ -60,19 +64,60 @@ def oracle_chunks(case: dict, by_id: dict[str, Chunk], retriever: MarkdownRetrie
     return [retriever.search(case["query"], 1)[0][0]]
 
 
+def sha256(path: str | Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def git_state() -> dict:
+    """結果がどのコードから出たかを残す。git がなければ None。"""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        return {"commit": git("rev-parse", "HEAD"), "dirty": bool(git("status", "--porcelain"))}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
+
+
+def run_header(settings: dict, clients: list[Client], cases_path: str | Path, conditions: list[str]) -> dict:
+    """JSONLの1行目。同じ結果を出し直すのに要るもの(コード、設定、プロンプト、モデル、試験)をすべて残す。"""
+    models = []
+    for c in clients:
+        try:
+            info = c.info()
+        except RuntimeError as e:
+            info = {"info_error": str(e)}
+        models.append({**dataclasses.asdict(c.spec), "generation": c.gen, **info})
+    return {
+        "kind": "run",
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "git": git_state(),
+        "python": platform.python_version(),
+        "settings": settings,  # プロンプトのテンプレートも含む
+        "note_sha256": sha256(ROOT / settings["bench"]["note"]),
+        "cases": {"path": Path(cases_path).name, "sha256": sha256(cases_path)},
+        "conditions": conditions,
+        "models": models,
+    }
+
+
 def run(client: Client, condition: str, chunks: list[Chunk], cases: list[dict], settings: dict, log=None) -> list[dict]:
     agent = RAGAgent(chunks, client, settings, extract=condition == "rag_extract")
     by_id = {c.id: c for c in chunks}
     rows = []
     for i, c in enumerate(cases, 1):
         print(f"\r{client.spec.name} / {condition}: {i}/{len(cases)}", end="", file=sys.stderr, flush=True)
-        if condition == "oracle":
-            a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
+        row = {"kind": "case", "model": client.spec.name, "condition": condition, "id": c["id"], "type": c["type"]}
+        try:
+            if condition == "oracle":
+                a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
+            else:
+                a = agent.answer(c["query"], closed=condition == "closed")
+        except RuntimeError as e:  # タイムアウトなど。その問いだけ失敗として残し、先へ進む
+            row |= {"error": str(e), "chunk_ids": [], "answer": "", "accuracy": None, "refused": False}
         else:
-            a = agent.answer(c["query"], closed=condition == "closed")
-        row = {"model": client.spec.name, "condition": condition, "id": c["id"], "type": c["type"],
-               "route": a.route, "chunk_ids": a.chunk_ids, "answer": a.text, "called": a.prompt is not None,
-               "t_generate": a.t_generate, **score(c, a.text, settings["prompt"]["not_found"])}
+            row |= {"route": a.route, "chunk_ids": a.chunk_ids, "answer": a.text, "called": a.prompt is not None,
+                    "t_generate": a.t_generate, "prompt": a.prompt, **a.meta, "error": None,
+                    **score(c, a.text, settings["prompt"]["not_found"])}
         rows.append(row)
         if log:
             log.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -86,6 +131,9 @@ def mean(xs: list) -> float | str:
 
 
 def summarize(rows: list[dict]) -> dict:
+    """エラーの問いは指標から外し、件数だけ出す(モデルの誤りとサーバの失敗を混ぜない)。"""
+    errors = sum(bool(r["error"]) for r in rows)
+    rows = [r for r in rows if not r["error"]]
     scored = [r for r in rows if r["accuracy"] is not None]
     times = [r["t_generate"] for r in rows if r["called"]]
     return {
@@ -94,7 +142,18 @@ def summarize(rows: list[dict]) -> dict:
         "FalseRefusal": mean([r["refused"] for r in scored]),
         "Inject.": mean([not r["obeyed_injection"] for r in rows if r["type"] == "injection"]),
         "生成ms": f"{statistics.fmean(times):.0f} / {max(times):.0f}" if times else "-",
+        "切断": sum(bool(r.get("truncated")) for r in rows),  # 上限のトークン数で切れた回答
+        "エラー": errors,
     }
+
+
+def context_warning(client: Client, rows: list[dict]) -> str | None:
+    """プロンプトと回答の合計が num_ctx を超えていれば、Ollamaがプロンプトの前の方(指示)を切り詰めた恐れがある。"""
+    n = client.gen.get("num_ctx")
+    used = max((r["prompt_tokens"] for r in rows if r.get("prompt_tokens")), default=0)
+    if n and used + client.gen["max_tokens"] > n:
+        return f"{client.spec.name}: プロンプト {used} + max_tokens {client.gen['max_tokens']} トークンが num_ctx {n} を超えています"
+    return None
 
 
 def retrieval_premise(chunks: list[Chunk], cases: list[dict], k: int) -> str:
@@ -144,7 +203,8 @@ def main() -> None:
 
     # 推論の前に、ノートと試験の誤りを見つける
     chunks = parse_sections((ROOT / settings["bench"]["note"]).read_text(encoding="utf-8"))
-    cases = load_cases(args.cases or ROOT / settings["bench"]["cases"], chunks)
+    cases_path = args.cases or ROOT / settings["bench"]["cases"]
+    cases = load_cases(cases_path, chunks)
 
     clients = [make_client(s, settings["generation"]) for s in specs]
     missing = []
@@ -163,20 +223,26 @@ def main() -> None:
     out = ROOT / "results" / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     out.parent.mkdir(exist_ok=True)
     with out.open("w", encoding="utf-8") as log:
+        log.write(json.dumps(run_header(settings, clients, cases_path, conditions), ensure_ascii=False) + "\n")
         results = [(c, cond, run(c, cond, chunks, cases, settings, log)) for c in clients for cond in conditions]
 
     print(retrieval_premise(chunks, cases, settings["retrieval"]["top_k"]) + "\n")
     summaries = [(c.spec.name, cond, summarize(rows)) for c, cond, rows in results]
     print(table(["モデル", "条件", *summaries[0][2]], [[m, cond, *s.values()] for m, cond, s in summaries]))
-    print(f"\n生成msは「平均 / 最大」。生の結果: {out.relative_to(ROOT).as_posix()}")
+    print(f"\n生成msは「平均 / 最大」。切断・エラーは件数で、エラーの問いは指標から外しています。"
+          f"生の結果: {out.relative_to(ROOT).as_posix()}")
+    for c in clients:
+        if w := context_warning(c, [r for client, _, rows in results if client is c for r in rows]):
+            print(f"注意: {w}", file=sys.stderr)
 
     if args.detail:
         for c, cond, rows in results:
             print(f"\n### {c.spec.name} / {cond}\n")
-            print(table(["ID", "種類", "文脈", "Accuracy", "断った", "回答"], [
+            print(table(["ID", "種類", "文脈", "Accuracy", "断った", "備考", "回答"], [
                 [r["id"], r["type"], ",".join(r["chunk_ids"]) or "-",
                  "-" if r["accuracy"] is None else r["accuracy"], "yes" if r["refused"] else "",
-                 r["answer"].replace("\n", " ").replace("|", "\\|")[:60]]
+                 "エラー" if r["error"] else "切断" if r.get("truncated") else "",
+                 (r["error"] or r["answer"]).replace("\n", " ").replace("|", "\\|")[:60]]
                 for r in rows
             ]))
 

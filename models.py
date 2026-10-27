@@ -15,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 閉じタグのない <think> (上限のトークン数で切れた思考)も末尾まで取り除く。残すと、思考の中の語で正解と採点されてしまう
+THINK = re.compile(r"<think>(.*?)(</think>|$)", re.S)
 
 
 @dataclass
@@ -69,21 +71,30 @@ class Client:
         except OSError as e:
             raise RuntimeError(f"{self.spec.name}: {self.base} に接続できません。サーバが動いているか確認してください: {e}") from e
 
-    def generate(self, prompt: str) -> tuple[str, float]:
+    def generate(self, prompt: str) -> tuple[str, float, dict]:
+        """回答、生成ms、メタ情報(stop、prompt_tokens、output_tokens、thinking、truncated)を返す。"""
         t0 = time.perf_counter()
-        text = self._chat(prompt)
+        text, meta = self._chat(prompt)
         ms = (time.perf_counter() - t0) * 1e3
-        return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip(), ms
+        thoughts = THINK.findall(text)  # [(思考, 閉じタグ)]
+        thinking = "\n".join(t.strip() for t in [meta.get("thinking") or "", *(t for t, _ in thoughts)] if t.strip())
+        unclosed = bool(thoughts) and not thoughts[-1][1]
+        meta.update(thinking=thinking or None, truncated=meta.get("stop") == "length" or unclosed)
+        return THINK.sub("", text).strip(), ms, meta
 
-    def _chat(self, prompt: str) -> str:
+    def _chat(self, prompt: str) -> tuple[str, dict]:
         raise NotImplementedError
 
     def installed(self) -> bool:
         raise NotImplementedError
 
+    def info(self) -> dict:
+        """ログに残す、サーバとモデルの情報(取れるものだけ)。"""
+        return {}
+
 
 class OllamaClient(Client):
-    def _chat(self, prompt: str) -> str:
+    def _chat(self, prompt: str) -> tuple[str, dict]:
         payload = {
             "model": self.spec.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -91,17 +102,34 @@ class OllamaClient(Client):
             "options": {"temperature": self.gen["temperature"], "num_predict": self.gen["max_tokens"],
                         "seed": self.gen["seed"]},
         }
+        if "num_ctx" in self.gen:
+            payload["options"]["num_ctx"] = self.gen["num_ctx"]
         if self.spec.think is not None:
             payload["think"] = self.spec.think  # /api/chat では options ではなくトップレベルのキー
-        return self._request("/api/chat", payload)["message"]["content"]
+        r = self._request("/api/chat", payload)
+        return r["message"]["content"], {
+            "stop": r.get("done_reason"),
+            "prompt_tokens": r.get("prompt_eval_count"),  # キャッシュが効くと、実際より少なく出る
+            "output_tokens": r.get("eval_count"),
+            "thinking": r["message"].get("thinking"),  # think = true のとき、content とは別に返る
+        }
+
+    def _tag(self) -> dict | None:
+        tags = {m["name"]: m for m in self._request("/api/tags")["models"]}
+        return tags.get(self.spec.model) or tags.get(f"{self.spec.model}:latest")
 
     def installed(self) -> bool:
-        names = {m["name"] for m in self._request("/api/tags")["models"]}
-        return self.spec.model in names or f"{self.spec.model}:latest" in names
+        return self._tag() is not None
+
+    def info(self) -> dict:
+        tag = self._tag() or {}
+        details = tag.get("details", {})
+        return {"server_version": self._request("/api/version").get("version"), "digest": tag.get("digest"),
+                "parameter_size": details.get("parameter_size"), "quantization": details.get("quantization_level")}
 
 
 class OpenAICompatClient(Client):
-    def _chat(self, prompt: str) -> str:
+    def _chat(self, prompt: str) -> tuple[str, dict]:
         payload = {
             "model": self.spec.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -109,7 +137,14 @@ class OpenAICompatClient(Client):
             "max_tokens": self.gen["max_tokens"],
             "seed": self.gen["seed"],
         }
-        return self._request("/v1/chat/completions", payload)["choices"][0]["message"]["content"]
+        r = self._request("/v1/chat/completions", payload)
+        choice, usage = r["choices"][0], r.get("usage") or {}
+        return choice["message"].get("content") or "", {
+            "stop": choice.get("finish_reason"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+            "thinking": choice["message"].get("reasoning_content"),  # llama.cpp などが思考を分けて返すとき
+        }
 
     def installed(self) -> bool:
         return self.spec.model in {m["id"] for m in self._request("/v1/models")["data"]}
