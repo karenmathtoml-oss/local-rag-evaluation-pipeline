@@ -15,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 閉じタグのない <think> (上限のトークン数で切れた思考)も末尾まで取り除く。残すと、思考の中の語で正解と採点されてしまう
+THINK = re.compile(r"<think>(.*?)(</think>|$)", re.S)
 
 
 @dataclass
@@ -43,6 +45,10 @@ class ChatTurn:
     prompt_tokens: int | None
     message: dict  # 会話の履歴にそのまま足す、assistant の発言
     ms: float = 0.0
+    output_tokens: int | None = None
+    thinking: str | None = None  # <think> の中身と、サーバが別に返した思考。採点には使わない
+    truncated: bool = False  # 上限のトークン数で切れた(done_reason が length か、<think> が閉じていない)
+    timings_ms: dict = field(default_factory=dict)  # サーバが測った時間(Ollamaだけ)。eval_ms と output_tokens でトークン/秒が出せる
 
 
 def load_models(path: str | Path) -> list[ModelSpec]:
@@ -99,12 +105,28 @@ class Client:
         t0 = time.perf_counter()
         turn = self._chat(messages, tools)
         turn.ms = (time.perf_counter() - t0) * 1e3
-        turn.content = re.sub(r"<think>.*?</think>", "", turn.content, flags=re.S).strip()
+        thoughts = THINK.findall(turn.content)  # [(思考, 閉じタグ)]
+        thinking = "\n".join(t.strip() for t in [turn.thinking or "", *(t for t, _ in thoughts)] if t.strip())
+        turn.thinking = thinking or None
+        turn.truncated = turn.done_reason == "length" or (bool(thoughts) and not thoughts[-1][1])
+        turn.content = THINK.sub("", turn.content).strip()
         return turn
 
-    def generate(self, prompt: str) -> tuple[str, float]:
+    def generate(self, prompt: str) -> tuple[str, float, dict]:
+        """回答、生成ms、メタ情報(stop、prompt_tokens、output_tokens、thinking、truncated)を返す。"""
         turn = self.chat([{"role": "user", "content": prompt}])
-        return turn.content, turn.ms
+        meta = {"stop": turn.done_reason, "prompt_tokens": turn.prompt_tokens, "output_tokens": turn.output_tokens,
+                "thinking": turn.thinking, "truncated": turn.truncated, **turn.timings_ms}
+        return turn.content, turn.ms, meta
+
+    def warmup(self) -> float:
+        """モデルをサーバに読み込ませる(1トークンだけ生成し、採点しない)。かかったmsを返す。
+        読み込みの時間が、1問目の生成msに入らないようにするため。"""
+        gen, self.gen = self.gen, {**self.gen, "max_tokens": 1}
+        try:
+            return self.generate("こんにちは")[1]
+        finally:
+            self.gen = gen
 
     def _chat(self, messages: list[dict], tools: list[dict] | None) -> ChatTurn:
         raise NotImplementedError
@@ -115,6 +137,10 @@ class Client:
 
     def installed(self) -> bool:
         raise NotImplementedError
+
+    def info(self) -> dict:
+        """ログに残す、サーバとモデルの情報(取れるものだけ)。"""
+        return {}
 
     def supports_tools(self) -> bool:
         raise NotImplementedError
@@ -137,14 +163,26 @@ class OllamaClient(Client):
         message = {"role": "assistant", "content": m.get("content") or ""}
         if m.get("tool_calls"):
             message["tool_calls"] = m["tool_calls"]
-        return ChatTurn(m.get("content") or "", calls, r.get("done_reason"), r.get("prompt_eval_count"), message)
+        return ChatTurn(m.get("content") or "", calls, r.get("done_reason"), r.get("prompt_eval_count"), message,
+                        output_tokens=r.get("eval_count"), thinking=m.get("thinking"),  # think = true のとき、思考は content と別に返る
+                        timings_ms={f"{k}_ms": r[f"{k}_duration"] / 1e6  # ナノ秒をミリ秒に
+                                    for k in ("load", "prompt_eval", "eval") if f"{k}_duration" in r})
 
     def tool_message(self, call: ToolCall, content: str) -> dict:
         return {"role": "tool", "tool_name": call.name, "content": content}
 
+    def _tag(self) -> dict | None:
+        tags = {m["name"]: m for m in self._request("/api/tags")["models"]}
+        return tags.get(self.spec.model) or tags.get(f"{self.spec.model}:latest")
+
     def installed(self) -> bool:
-        names = {m["name"] for m in self._request("/api/tags")["models"]}
-        return self.spec.model in names or f"{self.spec.model}:latest" in names
+        return self._tag() is not None
+
+    def info(self) -> dict:
+        tag = self._tag() or {}
+        details = tag.get("details", {})
+        return {"server_version": self._request("/api/version").get("version"), "digest": tag.get("digest"),
+                "parameter_size": details.get("parameter_size"), "quantization": details.get("quantization_level")}
 
     def supports_tools(self) -> bool:
         return "tools" in self._request("/api/show", {"model": self.spec.model}).get("capabilities", [])
@@ -169,8 +207,10 @@ class OpenAICompatClient(Client):
         message = {"role": "assistant", "content": m.get("content") or ""}
         if m.get("tool_calls"):
             message["tool_calls"] = m["tool_calls"]
-        return ChatTurn(m.get("content") or "", calls, choice.get("finish_reason"),
-                        (r.get("usage") or {}).get("prompt_tokens"), message)
+        usage = r.get("usage") or {}
+        return ChatTurn(m.get("content") or "", calls, choice.get("finish_reason"), usage.get("prompt_tokens"), message,
+                        output_tokens=usage.get("completion_tokens"),
+                        thinking=m.get("reasoning_content"))  # llama.cpp などが思考を分けて返すとき
 
     def tool_message(self, call: ToolCall, content: str) -> dict:
         return {"role": "tool", "tool_call_id": call.id, "content": content}

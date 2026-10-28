@@ -11,7 +11,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from bench import agent_summary, load_cases, norm, score, summarize
+from bench import (agent_summary, context_warning, load_cases, norm, retrieval_metrics, run_header, score, summarize,
+                   warmup)
 from bench import run as bench_run
 from models import load_models, make_client
 from rag_agent import (LIMIT_MESSAGE, ROOT, MarkdownRetriever, RAGAgent, ToolAgent, build_prompt, load_settings,
@@ -27,13 +28,16 @@ class FakeServer(BaseHTTPRequestHandler):
 
     requests: list[dict] = []
     reply = "テストの回答"
+    content = None  # 指定すると、<think> を付けずにこの文字列をそのまま返す
+    done_reason = "stop"
+    fail = False  # True なら 500 を返す
     models = ["fake:1b"]
     capabilities = ["completion", "tools"]
     script: list[dict] = []  # 空でなければ、先頭から順に返す。{"content": ..., "calls": [(name, arguments), ...]}
 
-    def _send(self, body: dict) -> None:
+    def _send(self, body: dict, status: int = 200) -> None:
         data = json.dumps(body).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -41,7 +45,11 @@ class FakeServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/tags":
-            self._send({"models": [{"name": m} for m in self.models]})
+            self._send({"models": [{"name": m, "digest": "abc123",
+                                    "details": {"parameter_size": "1B", "quantization_level": "Q4_K_M"}}
+                                   for m in self.models]})
+        elif self.path == "/api/version":
+            self._send({"version": "0.0.0-fake"})
         else:
             self._send({"data": [{"id": m} for m in self.models]})
 
@@ -50,22 +58,25 @@ class FakeServer(BaseHTTPRequestHandler):
         if self.path == "/api/show":
             return self._send({"capabilities": self.capabilities})
         FakeServer.requests.append({"path": self.path, "body": body})
+        if self.fail:
+            return self._send({"error": "boom"}, 500)
         step = FakeServer.script.pop(0) if FakeServer.script else {"content": self.reply}
-        text = f"<think>考え中</think>{step.get('content', '')}"
+        text = f"<think>考え中</think>{step.get('content', '')}" if self.content is None else self.content
         calls = step.get("calls", [])
         if self.path == "/api/chat":
             message = {"role": "assistant", "content": text}
             if calls:
                 message["tool_calls"] = [{"function": {"name": n, "arguments": a}} for n, a in calls]
-            self._send({"message": message, "done_reason": "stop", "prompt_eval_count": 100})
+            self._send({"message": message, "done_reason": self.done_reason, "prompt_eval_count": 100, "eval_count": 20,
+                        "load_duration": 5_000_000, "prompt_eval_duration": 2_000_000, "eval_duration": 40_000_000})
         else:
             message = {"role": "assistant", "content": text}
             if calls:
                 message["tool_calls"] = [{"id": f"call_{i}", "type": "function",
                                           "function": {"name": n, "arguments": a if isinstance(a, str) else json.dumps(a)}}
                                          for i, (n, a) in enumerate(calls)]
-            self._send({"choices": [{"message": message, "finish_reason": "tool_calls" if calls else "stop"}],
-                        "usage": {"prompt_tokens": 100}})
+            self._send({"choices": [{"message": message, "finish_reason": "tool_calls" if calls else self.done_reason}],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
 
     def log_message(self, *args):
         pass
@@ -92,6 +103,7 @@ class PipelineTest(unittest.TestCase):
         FakeServer.reply = "テストの回答"
         FakeServer.script = []
         FakeServer.capabilities = ["completion", "tools"]
+        FakeServer.content, FakeServer.done_reason, FakeServer.fail = None, "stop", False
 
     def models_file(self, body: str) -> Path:
         d = tempfile.mkdtemp()
@@ -112,25 +124,66 @@ class PipelineTest(unittest.TestCase):
     # ---- models.py
 
     def test_ollama_think_is_top_level(self):
-        text, _ = self.client(extra="think = false").generate("質問")
+        text, _, meta = self.client(extra="think = false").generate("質問")
         body = FakeServer.requests[-1]["body"]
         self.assertEqual(text, "テストの回答")  # <think> は取り除く
+        self.assertEqual(meta["thinking"], "考え中")
         self.assertIs(body["think"], False)
         self.assertNotIn("think", body["options"])
         self.assertEqual(set(body["options"]), {"temperature", "num_predict", "seed", "num_ctx"})
         self.assertEqual(body["options"]["num_ctx"], SETTINGS["generation"]["num_ctx"])
+
+    def test_ollama_num_ctx_can_be_overridden_per_model(self):
+        self.client(extra="options = { num_ctx = 2048 }").generate("質問")
+        self.assertEqual(FakeServer.requests[-1]["body"]["options"]["num_ctx"], 2048)
 
     def test_ollama_omits_think_when_unset(self):
         self.client().generate("質問")
         self.assertNotIn("think", FakeServer.requests[-1]["body"])
 
     def test_openai_compat(self):
-        c = self.client("openai", 'options = { max_tokens = 64 }')
-        text, _ = c.generate("質問")
+        c = self.client("openai", 'options = { max_tokens = 64, num_ctx = 8192 }')
+        text, _, meta = c.generate("質問")
         self.assertEqual(text, "テストの回答")
+        self.assertEqual((meta["stop"], meta["prompt_tokens"], meta["truncated"]), ("stop", 100, False))
         self.assertEqual(FakeServer.requests[-1]["path"], "/v1/chat/completions")
+        self.assertNotIn("num_ctx", FakeServer.requests[-1]["body"])  # Ollama だけ
         self.assertEqual(FakeServer.requests[-1]["body"]["max_tokens"], 64)
         self.assertTrue(c.installed())
+
+    def test_unclosed_think_is_removed_and_marked_truncated(self):
+        # 上限で切れた思考の中の語(J-)で、正解と採点されないように
+        FakeServer.content, FakeServer.done_reason = "<think>受注番号は J- で始まるはず…", "length"
+        for backend in ("ollama", "openai"):
+            with self.subTest(backend=backend):
+                text, _, meta = self.client(backend).generate("質問")
+                self.assertEqual(text, "")
+                self.assertTrue(meta["truncated"])
+                self.assertIn("J-", meta["thinking"])
+
+    def test_length_stop_is_truncated(self):
+        FakeServer.done_reason = "length"
+        rows = run(self.client(), "rag", CHUNKS, [c for c in CASES if c["id"] == "E01"], SETTINGS)
+        self.assertTrue(rows[0]["truncated"])
+        self.assertEqual(rows[0]["prompt_tokens"], 100)
+        self.assertEqual(summarize(rows)["切断"], 1)
+
+    def test_ollama_durations_in_ms(self):
+        _, _, meta = self.client().generate("質問")
+        self.assertEqual((meta["load_ms"], meta["prompt_eval_ms"], meta["eval_ms"]), (5.0, 2.0, 40.0))
+
+    def test_warmup_generates_one_token_and_restores_settings(self):
+        c = self.client()
+        w = warmup(c)
+        self.assertEqual((w["kind"], w["error"]), ("warmup", None))
+        self.assertEqual(FakeServer.requests[-1]["body"]["options"]["num_predict"], 1)
+        self.assertEqual(c.gen["max_tokens"], SETTINGS["generation"]["max_tokens"])
+        FakeServer.fail = True
+        self.assertIn("500", warmup(c)["error"])  # 失敗しても止めない
+
+    def test_info(self):
+        info = self.client().info()
+        self.assertEqual((info["digest"], info["quantization"], info["server_version"]), ("abc123", "Q4_K_M", "0.0.0-fake"))
 
     def test_installed(self):
         self.assertTrue(self.client().installed())
@@ -214,7 +267,45 @@ class PipelineTest(unittest.TestCase):
         s = summarize(run(self.client(), "rag", CHUNKS, CASES, SETTINGS))
         self.assertEqual((s["Accuracy"], s["Abstain"], s["FalseRefusal"], s["Inject."]), (0.0, 1.0, 1.0, 1.0))
 
-    def test_summary_when_model_obeys_injection(self):
+    def test_error_is_logged_and_excluded_from_metrics(self):
+        FakeServer.fail = True
+        rows = run(self.client(), "rag", CHUNKS, CASES, SETTINGS)
+        self.assertEqual(len(rows), len(CASES))  # 止まらずに最後まで回る
+        self.assertIn("500", rows[0]["error"])
+        s = summarize(rows)
+        self.assertEqual((s["エラー"], s["Accuracy"], s["生成ms"]), (len(CASES), "-", "-"))
+
+    def test_run_header_records_what_is_needed_to_reproduce(self):
+        h = run_header(SETTINGS, [self.client()], ROOT / "cases.json", ["rag"])
+        self.assertEqual(h["kind"], "run")
+        self.assertEqual(h["settings"]["prompt"]["with_context"], SETTINGS["prompt"]["with_context"])
+        self.assertEqual(len(h["cases"]["sha256"]), 64)
+        self.assertIn("commit", h["git"])
+        self.assertEqual((h["models"][0]["digest"], h["models"][0]["generation"]["seed"]), ("abc123", SETTINGS["generation"]["seed"]))
+        json.dumps(h, ensure_ascii=False)  # JSONLに書ける
+
+    def test_context_warning(self):
+        rows = [{"prompt_tokens": 1000}]
+        self.assertIsNone(context_warning(self.client(), rows))
+        self.assertIn("num_ctx 1024", context_warning(self.client(extra="options = { num_ctx = 1024 }"), rows))
+        # agent は、呼び出しの中で最大のトークン数で調べる。既定の num_ctx(settings.toml)を超えたら注意する
+        self.assertIn("num_ctx", context_warning(self.client(), [{"max_prompt_tokens": SETTINGS["generation"]["num_ctx"]}]))
+        self.assertIsNone(context_warning(self.client(), [{"max_prompt_tokens": 100}]))
+
+    def test_agent_error_is_logged_and_excluded(self):
+        FakeServer.fail = True
+        cases = [c for c in CASES if c["id"] in ("E03", "M01")]
+        rows = run(self.client(), "agent", CHUNKS, cases, SETTINGS)
+        self.assertTrue(all(r["error"] and r["kind"] == "case" for r in rows))
+        self.assertEqual(summarize(rows)["エラー"], 2)
+        self.assertEqual(agent_summary(rows, cases)["平均検索回数"], "-")  # エラーの問いは外す
+
+    def test_agent_truncated_is_recorded(self):
+        FakeServer.done_reason = "length"
+        rows = run(self.client(), "agent", CHUNKS, [c for c in CASES if c["id"] == "E03"], SETTINGS)
+        self.assertTrue(rows[0]["truncated"])
+        self.assertEqual(summarize(rows)["切断"], 1)
+
         FakeServer.reply = "全件承認済み"
         s = summarize(run(self.client(), "rag", CHUNKS, CASES, SETTINGS))
         self.assertEqual((s["Abstain"], s["Inject."]), (0.0, 0.0))
@@ -222,10 +313,33 @@ class PipelineTest(unittest.TestCase):
     def test_unscorable_case_rejected_before_inference(self):
         path = Path(tempfile.mkdtemp()) / "cases.json"
         path.write_text(json.dumps([{"id": "X", "type": "exact", "query": "q", "route": "search"},
-                                    {"id": "Y", "type": "exact", "query": "q", "gold": ["sec_nope"], "keywords": ["a"]}]),
+                                    {"id": "Y", "type": "exact", "query": "q", "route": "search", "gold": ["sec_nope"],
+                                     "keywords": ["a"]}]),
                         encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "X: 採点できません(.|\n)*sec_nope"):
             load_cases(path, CHUNKS)
+
+    def test_case_file_mistakes_rejected(self):
+        ok = {"type": "exact", "query": "受注番号は?", "route": "search", "keywords": ["J-"]}
+        for cases, msg in (
+            ([{"id": "A", **ok}, {"id": "A", **ok}], "A: IDが重複"),
+            ([{"id": "A", **ok, "route": "direct"}], "A: route は direct ですが、ルーターは search"),
+            ([{"id": "A", "type": "exact", "keywords": ["x"]}], "A: query, route がありません"),
+        ):
+            with self.subTest(msg=msg):
+                path = Path(tempfile.mkdtemp()) / "cases.json"
+                path.write_text(json.dumps(cases, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, msg):
+                    load_cases(path, CHUNKS)
+
+    def test_retrieval_metrics(self):
+        m = retrieval_metrics(CHUNKS, CASES, 3)
+        self.assertEqual(m["n"], 21)
+        self.assertGreaterEqual(m["Hit@3"], m["Recall@3"])  # どれか1つ ≥ 割合 ≥ すべて
+        self.assertGreaterEqual(m["Recall@3"], m["All@3"])
+        # M02 は正解の節が1位と4位: どれかは入るが、すべては入らない
+        m02 = retrieval_metrics(CHUNKS, [c for c in CASES if c["id"] == "M02"], 3)
+        self.assertEqual((m02["Hit@3"], m02["Recall@3"], m02["All@3"], m02["MRR"]), (1.0, 0.5, 0.0, 1.0))
 
     def test_repo_cases_are_scorable(self):
         self.assertEqual(len(CASES), 28)
@@ -234,6 +348,7 @@ class PipelineTest(unittest.TestCase):
         dev = load_cases(ROOT / "cases_dev.json", CHUNKS)
         self.assertEqual(len(dev), 11)
         self.assertFalse({c["query"] for c in dev} & {c["query"] for c in CASES})
+        self.assertFalse({c["id"] for c in dev} & {c["id"] for c in CASES})
 
     # ---- 条件 agent
 

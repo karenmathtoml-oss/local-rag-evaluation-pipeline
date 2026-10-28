@@ -1,27 +1,41 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
+import platform
 import re
 import statistics
+import subprocess
 import sys
 import time
 import unicodedata
 from pathlib import Path
 
 from models import Client, load_models, make_client
-from rag_agent import ROOT, Chunk, MarkdownRetriever, RAGAgent, ToolAgent, load_settings, parse_sections
+from rag_agent import ROOT, Chunk, MarkdownRetriever, QueryRouter, RAGAgent, ToolAgent, load_settings, parse_sections
 
 CONDITIONS = ("closed", "rag", "rag_extract", "oracle", "agent")
 TYPES = ("exact", "paraphrase", "multihop", "update", "direct", "unanswerable", "injection")
 
 
 def load_cases(path: str | Path, chunks: list[Chunk]) -> list[dict]:
-    """採点できないケース(必須の語も、含まれてはいけない語もなく、答えのない問いでもない)は、推論の前に止める。"""
+    """書き間違い(項目の欠け、IDの重複、ルーターの判定との食い違い)と、採点できないケース
+    (必須の語も、含まれてはいけない語もなく、答えのない問いでもない)は、推論の前に止める。"""
     cases = json.loads(Path(path).read_text(encoding="utf-8"))
     ids = {c.id for c in chunks}
-    errors = []
-    for c in cases:
+    router = QueryRouter()
+    errors, seen = [], set()
+    for i, c in enumerate(cases, 1):
+        if missing := [k for k in ("id", "type", "query", "route") if k not in c]:
+            errors.append(f"{c.get('id', f'{i}番目')}: {', '.join(missing)} がありません")
+            continue
+        if c["id"] in seen:
+            errors.append(f"{c['id']}: IDが重複しています")
+        seen.add(c["id"])
+        if (r := router.route(c["query"])) != c["route"]:
+            errors.append(f"{c['id']}: route は {c['route']} ですが、ルーターは {r} と判定します")
         if c["type"] not in TYPES:
             errors.append(f"{c['id']}: type は {' / '.join(TYPES)} のどれか")
         if not (c.get("keywords") or c.get("forbidden") or c["type"] == "unanswerable"):
@@ -60,6 +74,50 @@ def oracle_chunks(case: dict, by_id: dict[str, Chunk], retriever: MarkdownRetrie
     return [retriever.search(case["query"], 1)[0][0]]
 
 
+def sha256(path: str | Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def git_state() -> dict:
+    """結果がどのコードから出たかを残す。git がなければ None。"""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        return {"commit": git("rev-parse", "HEAD"), "dirty": bool(git("status", "--porcelain"))}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
+
+
+def run_header(settings: dict, clients: list[Client], cases_path: str | Path, conditions: list[str]) -> dict:
+    """JSONLの1行目。同じ結果を出し直すのに要るもの(コード、設定、プロンプト、モデル、試験)をすべて残す。"""
+    models = []
+    for c in clients:
+        try:
+            info = c.info()
+        except RuntimeError as e:
+            info = {"info_error": str(e)}
+        models.append({**dataclasses.asdict(c.spec), "generation": c.gen, **info})
+    return {
+        "kind": "run",
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "git": git_state(),
+        "python": platform.python_version(),
+        "settings": settings,  # プロンプトのテンプレートも含む
+        "note_sha256": sha256(ROOT / settings["bench"]["note"]),
+        "cases": {"path": Path(cases_path).name, "sha256": sha256(cases_path)},
+        "conditions": conditions,
+        "models": models,
+    }
+
+
+def warmup(client: Client) -> dict:
+    """JSONLに残す、予備の生成の行。失敗しても止めない(本番の問いでエラーとして数える)。"""
+    try:
+        return {"kind": "warmup", "model": client.spec.name, "ms": client.warmup(), "error": None}
+    except RuntimeError as e:
+        return {"kind": "warmup", "model": client.spec.name, "ms": None, "error": str(e)}
+
+
 def run(client: Client, condition: str, chunks: list[Chunk], cases: list[dict], settings: dict, log=None) -> list[dict]:
     agent = RAGAgent(chunks, client, settings, extract=condition == "rag_extract")
     tool_agent = ToolAgent(chunks, client, settings) if condition == "agent" else None
@@ -67,19 +125,26 @@ def run(client: Client, condition: str, chunks: list[Chunk], cases: list[dict], 
     rows = []
     for i, c in enumerate(cases, 1):
         print(f"\r{client.spec.name} / {condition}: {i}/{len(cases)}", end="", file=sys.stderr, flush=True)
-        if tool_agent:
-            a = tool_agent.answer(c["query"])
-            extra = {"route": "agent", "chunk_ids": list(dict.fromkeys(x for s in a.searches for x in s["ids"])),
-                     "called": True, "searches": a.searches, "bad_calls": a.bad_calls, "hit_limit": a.hit_limit,
-                     "model_calls": a.model_calls, "max_prompt_tokens": a.max_prompt_tokens, "done_reason": a.done_reason}
-        else:
-            if condition == "oracle":
-                a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
+        row = {"kind": "case", "model": client.spec.name, "condition": condition, "id": c["id"], "type": c["type"]}
+        try:
+            if tool_agent:
+                a = tool_agent.answer(c["query"])
+                extra = {"route": "agent", "chunk_ids": list(dict.fromkeys(x for s in a.searches for x in s["ids"])),
+                         "called": True, "prompt": None, "searches": a.searches, "bad_calls": a.bad_calls,
+                         "hit_limit": a.hit_limit, "model_calls": a.model_calls, "max_prompt_tokens": a.max_prompt_tokens,
+                         "done_reason": a.done_reason, "truncated": a.truncated, "thinking": a.thinking}
             else:
-                a = agent.answer(c["query"], closed=condition == "closed")
-            extra = {"route": a.route, "chunk_ids": a.chunk_ids, "called": a.prompt is not None}
-        row = {"model": client.spec.name, "condition": condition, "id": c["id"], "type": c["type"], **extra,
-               "answer": a.text, "t_generate": a.t_generate, **score(c, a.text, settings["prompt"]["not_found"])}
+                if condition == "oracle":
+                    a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
+                else:
+                    a = agent.answer(c["query"], closed=condition == "closed")
+                extra = {"route": a.route, "chunk_ids": a.chunk_ids, "called": a.prompt is not None,
+                         "prompt": a.prompt, **a.meta}
+        except RuntimeError as e:  # タイムアウトなど。その問いだけ失敗として残し、先へ進む
+            row |= {"error": str(e), "chunk_ids": [], "answer": "", "accuracy": None, "refused": False}
+        else:
+            row |= {**extra, "answer": a.text, "t_generate": a.t_generate, "error": None,
+                    **score(c, a.text, settings["prompt"]["not_found"])}
         rows.append(row)
         if log:
             log.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -93,6 +158,9 @@ def mean(xs: list) -> float | str:
 
 
 def summarize(rows: list[dict]) -> dict:
+    """エラーの問いは指標から外し、件数だけ出す(モデルの誤りとサーバの失敗を混ぜない)。"""
+    errors = sum(bool(r["error"]) for r in rows)
+    rows = [r for r in rows if not r["error"]]
     scored = [r for r in rows if r["accuracy"] is not None]
     times = [r["t_generate"] for r in rows if r["called"]]
     return {
@@ -101,11 +169,25 @@ def summarize(rows: list[dict]) -> dict:
         "FalseRefusal": mean([r["refused"] for r in scored]),
         "Inject.": mean([not r["obeyed_injection"] for r in rows if r["type"] == "injection"]),
         "生成ms": f"{statistics.fmean(times):.0f} / {max(times):.0f}" if times else "-",
+        "切断": sum(bool(r.get("truncated")) for r in rows),  # 上限のトークン数で切れた回答
+        "エラー": errors,
     }
 
 
+def context_warning(client: Client, rows: list[dict]) -> str | None:
+    """プロンプトと回答の合計が num_ctx を超えていれば、Ollamaがプロンプトの前の方(指示)を切り詰めた恐れがある。"""
+    n = client.gen.get("num_ctx")
+    # agent は呼び出しごとに文脈が積み上がるので、max_prompt_tokens(呼び出しの中の最大)を見る
+    used = max((r.get("prompt_tokens") or r.get("max_prompt_tokens") or 0 for r in rows), default=0)
+    if n and used + client.gen["max_tokens"] > n:
+        return f"{client.spec.name}: プロンプト {used} + max_tokens {client.gen['max_tokens']} トークンが num_ctx {n} を超えています"
+    return None
+
+
 def agent_summary(rows: list[dict], cases: list[dict]) -> dict:
-    """条件 agent だけの、検索の判断の指標。検索の再現率は、表の前の rag の Hit@k と比べる。"""
+    """条件 agent だけの、検索の判断の指標。検索の再現率は、表の前の rag の All@k(正解の節がすべて入った割合)と比べる。
+    エラーの問いは、検索の結果がないので外す(件数は表の「エラー」に出る)。"""
+    rows = [r for r in rows if not r["error"]]
     gold = {c["id"]: c.get("gold", []) for c in cases}
     return {
         "検索の再現率": mean([set(gold[r["id"]]) <= set(r["chunk_ids"]) for r in rows if gold[r["id"]]]),
@@ -118,23 +200,34 @@ def agent_summary(rows: list[dict], cases: list[dict]) -> dict:
 
 
 def context_cell(row: dict) -> str:
-    if row["condition"] == "agent":
+    if row["condition"] == "agent" and not row["error"]:
         return " / ".join(f"「{s['query']}」→{','.join(s['ids'])}" for s in row["searches"]) or "(検索なし)"
     return ",".join(row["chunk_ids"]) or "-"
 
 
-def retrieval_premise(chunks: list[Chunk], cases: list[dict], k: int) -> str:
-    """検索の指標はモデルによって変わらないので、表の前に1回だけ出す。"""
+def retrieval_metrics(chunks: list[Chunk], cases: list[dict], k: int) -> dict:
+    """正解の節がある問いについて、Hit@k(どれかが上位k件)、Recall@k(上位k件に入った割合)、
+    All@k(すべてが上位k件。multihop で rag が答えられる上限)、MRR(最初の正解の順位の逆数)。"""
     retriever = MarkdownRetriever(chunks)
-    hit, rr = [], []
+    hit, recall, all_, rr = [], [], [], []
     for c in cases:
         if not c.get("gold"):
             continue
         ids = [ch.id for ch, _ in retriever.search(c["query"])]
         ranks = [ids.index(g) + 1 for g in c["gold"]]
-        hit.append(max(ranks) <= k)  # 正解の節がすべて上位k件に入ったか
+        hit.append(min(ranks) <= k)
+        recall.append(sum(r <= k for r in ranks) / len(ranks))
+        all_.append(max(ranks) <= k)
         rr.append(1 / min(ranks))
-    return f"検索の前提(BM25、上位{k}件、{len(hit)}問): Hit@{k} {statistics.fmean(hit):.2f} / MRR {statistics.fmean(rr):.2f}"
+    f = statistics.fmean
+    return {"n": len(hit), f"Hit@{k}": f(hit), f"Recall@{k}": f(recall), f"All@{k}": f(all_), "MRR": f(rr)}
+
+
+def retrieval_premise(chunks: list[Chunk], cases: list[dict], k: int) -> str:
+    """検索の指標はモデルによって変わらないので、表の前に1回だけ出す。"""
+    m = retrieval_metrics(chunks, cases, k)
+    n = m.pop("n")
+    return f"検索の前提(BM25、上位{k}件、{n}問): " + " / ".join(f"{name} {v:.2f}" for name, v in m.items())
 
 
 def table(header: list[str], rows: list[list]) -> str:
@@ -149,6 +242,7 @@ def main() -> None:
     p.add_argument("--conditions", help=f"カンマ区切りで {' / '.join(CONDITIONS)}。省略時は settings.toml の値")
     p.add_argument("--check", action="store_true", help="モデルが入っているかを確かめるだけ")
     p.add_argument("--detail", action="store_true", help="1問ごとの結果も出す")
+    p.add_argument("--no-warmup", action="store_true", help="モデルごとの予備の生成(読み込みを生成msから外す)をしない")
     p.add_argument("--cases", help="試験のファイル(例: cases_dev.json)。省略時は settings.toml の bench.cases")
     p.add_argument("--settings", default=ROOT / "settings.toml")
     p.add_argument("--models-file", default=ROOT / "models.toml")
@@ -170,7 +264,8 @@ def main() -> None:
 
     # 推論の前に、ノートと試験の誤りを見つける
     chunks = parse_sections((ROOT / settings["bench"]["note"]).read_text(encoding="utf-8"))
-    cases = load_cases(args.cases or ROOT / settings["bench"]["cases"], chunks)
+    cases_path = args.cases or ROOT / settings["bench"]["cases"]
+    cases = load_cases(cases_path, chunks)
 
     clients = [make_client(s, settings["generation"]) for s in specs]
     missing = []
@@ -196,14 +291,31 @@ def main() -> None:
     out = ROOT / "results" / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     out.parent.mkdir(exist_ok=True)
     with out.open("w", encoding="utf-8") as log:
-        results = [(c, cond, run(c, cond, chunks, cases, settings, log)) for c, cond in pairs]
+        log.write(json.dumps(run_header(settings, clients, cases_path, conditions), ensure_ascii=False) + "\n")
+        results = []
+        for c in clients:
+            todo = [cond for x, cond in pairs if x is c]
+            if not todo:
+                continue
+            # 全モデルを先に読み込むと、メモリの都合で追い出されることがあるので、そのモデルを回す直前に読み込む
+            if not args.no_warmup:
+                w = warmup(c)
+                log.write(json.dumps(w, ensure_ascii=False) + "\n")
+                print(f"{c.spec.name}: 予備の生成 " + (f"{w['ms']:.0f}ms" if w["ms"] is not None else f"失敗: {w['error']}"),
+                      file=sys.stderr)
+            results += [(c, cond, run(c, cond, chunks, cases, settings, log)) for cond in todo]
     if not results:
         sys.exit("評価できる組み合わせがありません")
 
     print(retrieval_premise(chunks, cases, settings["retrieval"]["top_k"]) + "\n")
     summaries = [(c.spec.name, cond, summarize(rows)) for c, cond, rows in results]
     print(table(["モデル", "条件", *summaries[0][2]], [[m, cond, *s.values()] for m, cond, s in summaries]))
-    print(f"\n生成msは「平均 / 最大」。生の結果: {out.relative_to(ROOT).as_posix()}")
+    note = "(予備の生成なし。1問目に読み込みの時間を含む)" if args.no_warmup else ""
+    print(f"\n生成msは「平均 / 最大」{note}。切断・エラーは件数で、エラーの問いは指標から外しています。"
+          f"生の結果: {out.relative_to(ROOT).as_posix()}")
+    for c in clients:
+        if w := context_warning(c, [r for client, _, rows in results if client is c for r in rows]):
+            print(f"注意: {w}", file=sys.stderr)
 
     agent_rows = [(c.spec.name, agent_summary(rows, cases)) for c, cond, rows in results if cond == "agent"]
     if agent_rows:
@@ -213,10 +325,11 @@ def main() -> None:
     if args.detail:
         for c, cond, rows in results:
             print(f"\n### {c.spec.name} / {cond}\n")
-            print(table(["ID", "種類", "文脈", "Accuracy", "断った", "回答"], [
+            print(table(["ID", "種類", "文脈", "Accuracy", "断った", "備考", "回答"], [
                 [r["id"], r["type"], context_cell(r).replace("|", "\\|"),
                  "-" if r["accuracy"] is None else r["accuracy"], "yes" if r["refused"] else "",
-                 r["answer"].replace("\n", " ").replace("|", "\\|")[:60]]
+                 "エラー" if r["error"] else "切断" if r.get("truncated") else "",
+                 (r["error"] or r["answer"]).replace("\n", " ").replace("|", "\\|")[:60]]
                 for r in rows
             ]))
 

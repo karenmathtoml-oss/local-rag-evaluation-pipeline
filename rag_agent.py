@@ -13,7 +13,7 @@ import string
 import tomllib
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -38,10 +38,11 @@ class Answer:
     chunk_ids: list[str]
     prompt: str | None  # None は、τで足切りしてモデルを呼ばなかったとき
     t_generate: float  # ミリ秒
+    meta: dict = field(default_factory=dict)  # 停止の理由やトークン数(models.Client.generate を参照)
 
 
 class Generator(Protocol):
-    def generate(self, prompt: str) -> tuple[str, float]: ...
+    def generate(self, prompt: str) -> tuple[str, float, dict]: ...
 
 
 def load_settings(path: str | Path = ROOT / "settings.toml") -> dict:
@@ -177,8 +178,8 @@ class RAGAgent:
 
     def _ask(self, kind: str, query: str, chunks: list[Chunk], route: str) -> Answer:
         prompt = build_prompt(self.prompts, kind, query, chunks)
-        text, ms = self.generator.generate(prompt)
-        return Answer(text, route, [c.id for c in chunks], prompt, ms)
+        text, ms, meta = self.generator.generate(prompt)
+        return Answer(text, route, [c.id for c in chunks], prompt, ms, meta)
 
 
 SEARCH_TOOL = {
@@ -209,6 +210,8 @@ class AgentAnswer:
     max_prompt_tokens: int | None
     done_reason: str | None  # 最後の呼び出しの止まった理由
     t_generate: float  # すべての呼び出しの合計(ミリ秒)
+    truncated: bool = False  # 最後の呼び出しが、上限のトークン数で切れた
+    thinking: str | None = None  # 最後の呼び出しの思考。採点には使わない
 
 
 class ToolAgent:
@@ -257,14 +260,14 @@ class ToolAgent:
     def _result(text: str, searches: list[dict], bad_calls: int, hit_limit: bool, turns: list) -> AgentAnswer:
         tokens = [t.prompt_tokens for t in turns if t.prompt_tokens is not None]
         return AgentAnswer(text, searches, bad_calls, hit_limit, len(turns), max(tokens, default=None),
-                           turns[-1].done_reason, sum(t.ms for t in turns))
+                           turns[-1].done_reason, sum(t.ms for t in turns), turns[-1].truncated, turns[-1].thinking)
 
 
 class PromptOnly:
     """モデルを呼ばずに、送るはずのプロンプトを返す(--model を省いたときの確認用)。"""
 
-    def generate(self, prompt: str) -> tuple[str, float]:
-        return prompt, 0.0
+    def generate(self, prompt: str) -> tuple[str, float, dict]:
+        return prompt, 0.0, {}
 
 
 def main() -> None:
@@ -296,6 +299,8 @@ def main() -> None:
             print(f"search: {s['query']} -> {', '.join(s['ids'])}")
         print(f"answer: {a.text}")
         print(f"time  : {a.t_generate:.0f}ms(モデルの呼び出し {a.model_calls} 回{'、上限で打ち切り' if a.hit_limit else ''})")
+        if a.truncated:
+            print("note  : 上限のトークン数で回答が切れました(max_tokens を増やしてください)")
         return
     a = RAGAgent(chunks, generator, settings, extract=args.extract).answer(args.query)
     print(f"route : {a.route}")
@@ -303,6 +308,8 @@ def main() -> None:
     if args.model:
         print(f"answer: {a.text}")
         print(f"time  : {a.t_generate:.0f}ms")
+        if a.meta.get("truncated"):
+            print("note  : 上限のトークン数で回答が切れました(max_tokens を増やしてください)")
     else:
         print(f"prompt:\n{a.prompt or '(τで足切り。モデルは呼ばない)'}")
 
