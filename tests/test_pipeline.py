@@ -2,17 +2,21 @@
 
     python -m unittest
 """
+import collections
 import contextlib
 import io
 import json
+import sys
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from bench import (agent_summary, context_warning, load_cases, norm, retrieval_metrics, run_header, score, summarize,
                    warmup)
+from bench import main as bench_main
 from bench import run as bench_run
 from models import load_models, make_client
 from rag_agent import (LIMIT_MESSAGE, ROOT, MarkdownRetriever, RAGAgent, ToolAgent, build_prompt, load_settings,
@@ -31,6 +35,8 @@ class FakeServer(BaseHTTPRequestHandler):
     content = None  # 指定すると、<think> を付けずにこの文字列をそのまま返す
     done_reason = "stop"
     fail = False  # True なら 500 を返す
+    raw = None  # bytes を指定すると、POST にはこれをそのまま 200 で返す(壊れた応答のふり)
+    raw_length = None  # raw を返すとき、Content-Length に書く値(本文より大きくすると、途中で切れた応答になる)
     models = ["fake:1b"]
     capabilities = ["completion", "tools"]
     script: list[dict] = []  # 空でなければ、先頭から順に返す。{"content": ..., "calls": [(name, arguments), ...]}
@@ -60,6 +66,11 @@ class FakeServer(BaseHTTPRequestHandler):
         FakeServer.requests.append({"path": self.path, "body": body})
         if self.fail:
             return self._send({"error": "boom"}, 500)
+        if self.raw is not None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(self.raw_length or len(self.raw)))
+            self.end_headers()
+            return self.wfile.write(self.raw)
         step = FakeServer.script.pop(0) if FakeServer.script else {"content": self.reply}
         text = f"<think>考え中</think>{step.get('content', '')}" if self.content is None else self.content
         calls = step.get("calls", [])
@@ -104,6 +115,7 @@ class PipelineTest(unittest.TestCase):
         FakeServer.script = []
         FakeServer.capabilities = ["completion", "tools"]
         FakeServer.content, FakeServer.done_reason, FakeServer.fail = None, "stop", False
+        FakeServer.raw, FakeServer.raw_length = None, None
 
     def models_file(self, body: str) -> Path:
         d = tempfile.mkdtemp()
@@ -160,6 +172,34 @@ class PipelineTest(unittest.TestCase):
                 self.assertEqual(text, "")
                 self.assertTrue(meta["truncated"])
                 self.assertIn("J-", meta["thinking"])
+
+    def test_bare_close_think_is_removed(self):
+        # テンプレートがプロンプトに <think> を入れたモデルは、開きタグなしで「思考</think>回答」と返す
+        FakeServer.content = "受注番号は J- で始まるはず。</think>分かりません"
+        for backend in ("ollama", "openai"):
+            with self.subTest(backend=backend):
+                text, _, meta = self.client(backend).generate("質問")
+                self.assertEqual(text, "分かりません")
+                self.assertIn("J-", meta["thinking"])
+                self.assertFalse(meta["truncated"])  # 閉じているので、切断ではない
+        rows = run(self.client(), "rag", CHUNKS, [c for c in CASES if c["id"] == "E01"], SETTINGS)
+        self.assertEqual(rows[0]["accuracy"], 0.0)  # 思考の中の J- で、正解と採点されない
+
+    def test_unexpected_responses_are_errors_not_crashes(self):
+        cases = [c for c in CASES if c["id"] in ("E01", "E02")]
+        for name, backend, raw, length in (
+            ("JSONではない", "ollama", b"not json", None),
+            ("エラーだけの本文", "ollama", b'{"error": "model failed to load"}', None),
+            ("choices が空", "openai", b'{"choices": []}', None),
+            ("途中で切れた本文", "ollama", b'{"message": {"con', 100),
+        ):
+            with self.subTest(name):
+                FakeServer.raw, FakeServer.raw_length = raw, length
+                with self.assertRaises(RuntimeError):
+                    self.client(backend).generate("質問")
+                rows = run(self.client(backend), "rag", CHUNKS, cases, SETTINGS)
+                self.assertEqual([bool(r["error"]) for r in rows], [True, True])  # 2問目まで回る
+                self.assertEqual(summarize(rows)["エラー"], 2)
 
     def test_length_stop_is_truncated(self):
         FakeServer.done_reason = "length"
@@ -291,6 +331,12 @@ class PipelineTest(unittest.TestCase):
         # agent は、呼び出しの中で最大のトークン数で調べる。既定の num_ctx(settings.toml)を超えたら注意する
         self.assertIn("num_ctx", context_warning(self.client(), [{"max_prompt_tokens": SETTINGS["generation"]["num_ctx"]}]))
         self.assertIsNone(context_warning(self.client(), [{"max_prompt_tokens": 100}]))
+
+    def test_agent_rows_use_the_same_stop_key(self):
+        FakeServer.done_reason = "length"
+        rows = run(self.client(), "agent", CHUNKS, [c for c in CASES if c["id"] == "E03"], SETTINGS)
+        self.assertEqual(rows[0]["stop"], "length")
+        self.assertNotIn("done_reason", rows[0])
 
     def test_agent_error_is_logged_and_excluded(self):
         FakeServer.fail = True
@@ -435,6 +481,66 @@ class PipelineTest(unittest.TestCase):
         a = RAGAgent(CHUNKS, PromptOnly(), SETTINGS).answer("受注番号はどんな形式?")
         self.assertEqual(a.chunk_ids[0], "sec_order_in")
         self.assertIn("ノートに記載がありません", a.prompt)
+
+
+    # ---- bench.main() の配線: agent の飛ばし、予備の生成、ログの書き出し
+
+    def run_main(self, *args: str):
+        results = tempfile.mkdtemp()
+        models = self.models_file(f'[[models]]\nname = "fake"\nbackend = "ollama"\nmodel = "fake:1b"\n'
+                                  f'base_url = "{self.url}"\n')
+        argv = ["bench.py", "--models-file", str(models), "--results-dir", results, *args]
+        out, err, code = io.StringIO(), io.StringIO(), None
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                bench_main()
+            except SystemExit as e:
+                code = e.code
+        logs = list(Path(results).glob("*.jsonl"))
+        rows = [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()] if logs else []
+        return out.getvalue(), err.getvalue(), code, rows
+
+    def test_runs_rag_and_agent_with_warmup(self):
+        out, _, code, rows = self.run_main("--conditions", "rag,agent")
+        self.assertIsNone(code)
+        self.assertEqual([r["kind"] for r in rows[:3]], ["run", "warmup", "case"])  # 順序: 設定、予備の生成、1問目
+        self.assertEqual(collections.Counter(r["kind"] for r in rows), {"run": 1, "warmup": 1, "case": 56})
+        self.assertEqual(rows[0]["skipped"], [])
+        self.assertIn("エージェントの検索", out)
+        agent_rows = [r for r in rows if r.get("condition") == "agent"]
+        self.assertTrue(all("stop" in r and "done_reason" not in r for r in agent_rows))
+
+    def test_agent_is_skipped_for_models_without_tools(self):
+        FakeServer.capabilities = ["completion"]
+        out, err, code, rows = self.run_main("--conditions", "rag,agent")
+        self.assertIsNone(code)
+        self.assertIn("飛ばします", err)
+        self.assertEqual(rows[0]["conditions"], ["rag", "agent"])  # 指定された条件
+        self.assertEqual([(s["model"], s["condition"]) for s in rows[0]["skipped"]], [("fake", "agent")])
+        self.assertEqual({r["condition"] for r in rows if r["kind"] == "case"}, {"rag"})
+        self.assertNotIn("エージェントの検索", out)
+
+    def test_exits_when_nothing_is_left_to_run(self):
+        FakeServer.capabilities = ["completion"]
+        _, _, code, rows = self.run_main("--conditions", "agent")
+        self.assertEqual(code, "評価できる組み合わせがありません")
+        self.assertEqual([r["kind"] for r in rows], ["run"])  # 設定の行だけ。飛ばした理由は残る
+        self.assertEqual(len(rows[0]["skipped"]), 1)
+        self.assertEqual(FakeServer.requests, [])  # 予備の生成もしない
+
+    def test_no_warmup(self):
+        out, _, _, rows = self.run_main("--conditions", "rag", "--no-warmup")
+        self.assertNotIn("warmup", {r["kind"] for r in rows})
+        self.assertIn("予備の生成なし", out)
+
+    def test_server_errors_do_not_stop_the_run(self):
+        FakeServer.fail = True
+        out, _, code, rows = self.run_main("--conditions", "rag")
+        self.assertIsNone(code)
+        self.assertIsNotNone(next(r for r in rows if r["kind"] == "warmup")["error"])  # 予備の生成の失敗も記録
+        cases = [r for r in rows if r["kind"] == "case"]
+        self.assertEqual((len(cases), sum(bool(r["error"]) for r in cases)), (28, 28))
+        self.assertIn("| fake | rag | - | - | - | - | - | 0 | 28 |", out)
 
 
 if __name__ == "__main__":

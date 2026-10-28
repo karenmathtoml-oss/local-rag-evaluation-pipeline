@@ -88,8 +88,10 @@ def git_state() -> dict:
         return {"commit": None, "dirty": None}
 
 
-def run_header(settings: dict, clients: list[Client], cases_path: str | Path, conditions: list[str]) -> dict:
-    """JSONLの1行目。同じ結果を出し直すのに要るもの(コード、設定、プロンプト、モデル、試験)をすべて残す。"""
+def run_header(settings: dict, clients: list[Client], cases_path: str | Path, conditions: list[str],
+               skipped: list[dict] = ()) -> dict:
+    """JSONLの1行目。同じ結果を出し直すのに要るもの(コード、設定、プロンプト、モデル、試験)をすべて残す。
+    conditions は指定された条件。モデルが対応していなくて回さなかった組み合わせは、skipped に残す。"""
     models = []
     for c in clients:
         try:
@@ -106,6 +108,7 @@ def run_header(settings: dict, clients: list[Client], cases_path: str | Path, co
         "note_sha256": sha256(ROOT / settings["bench"]["note"]),
         "cases": {"path": Path(cases_path).name, "sha256": sha256(cases_path)},
         "conditions": conditions,
+        "skipped": list(skipped),
         "models": models,
     }
 
@@ -132,7 +135,7 @@ def run(client: Client, condition: str, chunks: list[Chunk], cases: list[dict], 
                 extra = {"route": "agent", "chunk_ids": list(dict.fromkeys(x for s in a.searches for x in s["ids"])),
                          "called": True, "prompt": None, "searches": a.searches, "bad_calls": a.bad_calls,
                          "hit_limit": a.hit_limit, "model_calls": a.model_calls, "max_prompt_tokens": a.max_prompt_tokens,
-                         "done_reason": a.done_reason, "truncated": a.truncated, "thinking": a.thinking}
+                         "stop": a.done_reason, "truncated": a.truncated, "thinking": a.thinking}
             else:
                 if condition == "oracle":
                     a = agent.answer(c["query"], chunks=oracle_chunks(c, by_id, agent.retriever))
@@ -246,8 +249,10 @@ def main() -> None:
     p.add_argument("--cases", help="試験のファイル(例: cases_dev.json)。省略時は settings.toml の bench.cases")
     p.add_argument("--settings", default=ROOT / "settings.toml")
     p.add_argument("--models-file", default=ROOT / "models.toml")
+    p.add_argument("--results-dir", default=ROOT / "results", help="生の結果(JSONL)を置くディレクトリ")
     args = p.parse_args()
-    sys.stdout.reconfigure(encoding="utf-8")  # Windowsでリダイレクトしても表が文字化けしないように
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # Windowsでリダイレクトしても表が文字化けしないように
 
     settings = load_settings(args.settings)
     specs = load_models(args.models_file)
@@ -282,16 +287,18 @@ def main() -> None:
         sys.exit(1 if missing else 0)
 
     pairs = [(c, cond) for c in clients for cond in conditions]
+    skipped = []
     if "agent" in conditions:
         for c in clients:
             if not c.supports_tools():
                 print(f"{c.spec.name}: 道具の呼び出しに対応していないので、agent の条件は飛ばします", file=sys.stderr)
                 pairs = [(x, cond) for x, cond in pairs if not (x is c and cond == "agent")]
+                skipped.append({"model": c.spec.name, "condition": "agent", "reason": "道具の呼び出しに非対応"})
 
-    out = ROOT / "results" / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-    out.parent.mkdir(exist_ok=True)
+    out = Path(args.results_dir) / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as log:
-        log.write(json.dumps(run_header(settings, clients, cases_path, conditions), ensure_ascii=False) + "\n")
+        log.write(json.dumps(run_header(settings, clients, cases_path, conditions, skipped), ensure_ascii=False) + "\n")
         results = []
         for c in clients:
             todo = [cond for x, cond in pairs if x is c]
@@ -312,7 +319,7 @@ def main() -> None:
     print(table(["モデル", "条件", *summaries[0][2]], [[m, cond, *s.values()] for m, cond, s in summaries]))
     note = "(予備の生成なし。1問目に読み込みの時間を含む)" if args.no_warmup else ""
     print(f"\n生成msは「平均 / 最大」{note}。切断・エラーは件数で、エラーの問いは指標から外しています。"
-          f"生の結果: {out.relative_to(ROOT).as_posix()}")
+          f"生の結果: {out.relative_to(ROOT).as_posix() if out.is_relative_to(ROOT) else out}")
     for c in clients:
         if w := context_warning(c, [r for client, _, rows in results if client is c for r in rows]):
             print(f"注意: {w}", file=sys.stderr)
