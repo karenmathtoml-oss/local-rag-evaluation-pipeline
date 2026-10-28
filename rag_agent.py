@@ -1,8 +1,9 @@
-"""Markdownノートに対するRAGの基盤(分割、BM25、ルーター、文脈の圧縮、プロンプト)。
+"""Markdownノートに対するRAGの基盤(分割、BM25、ルーター、文脈の圧縮、プロンプト、検索をモデルに任せるエージェント)。
 
 評価の対象ではなく、モデルを同じ条件で比べるための土台。設定は settings.toml から読む。
     python rag_agent.py "受注番号はどんな形式?"                      # モデルに送るプロンプトを表示するだけ
     python rag_agent.py "受注番号はどんな形式?" --model qwen3-1.7b   # models.toml の名前で1問だけ聞く
+    python rag_agent.py "受注番号はどんな形式?" --model qwen3-1.7b --agent   # 検索をモデルに任せる
 """
 from __future__ import annotations
 

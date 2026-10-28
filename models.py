@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import time
@@ -15,7 +16,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
-# 閉じタグのない <think> (上限のトークン数で切れた思考)も末尾まで取り除く。残すと、思考の中の語で正解と採点されてしまう
+# 閉じタグのない <think> (上限のトークン数で切れた思考)も末尾まで取り除く。残すと、思考の中の語で正解と採点されてしまう。
+# 開きタグのない </think> は、Client.chat が <think> を補ってから、この式にかける
 THINK = re.compile(r"<think>(.*?)(</think>|$)", re.S)
 
 
@@ -100,11 +102,20 @@ class Client:
                                f"{e.read().decode(errors='replace')[:200]}") from e
         except OSError as e:
             raise RuntimeError(f"{self.spec.name}: {self.base} に接続できません。サーバが動いているか確認してください: {e}") from e
+        except (http.client.HTTPException, ValueError) as e:  # 応答が途中で切れた、JSONとして読めない
+            raise RuntimeError(f"{self.spec.name}: {self.base + path} の応答を読めません: {e}") from e
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatTurn:
         t0 = time.perf_counter()
-        turn = self._chat(messages, tools)
+        try:
+            turn = self._chat(messages, tools)
+        except (KeyError, IndexError, TypeError, AttributeError) as e:  # 200 でも、想定した形の応答ではなかった
+            raise RuntimeError(f"{self.spec.name}: 想定外の応答です({type(e).__name__}: {e})") from e
         turn.ms = (time.perf_counter() - t0) * 1e3
+        close, opened = turn.content.find("</think>"), turn.content.find("<think>")
+        if close != -1 and (opened == -1 or close < opened):
+            # 開きタグのない </think>: テンプレートがプロンプトに <think> を入れたモデルは、思考から返してくる
+            turn.content = "<think>" + turn.content
         thoughts = THINK.findall(turn.content)  # [(思考, 閉じタグ)]
         thinking = "\n".join(t.strip() for t in [turn.thinking or "", *(t for t, _ in thoughts)] if t.strip())
         turn.thinking = thinking or None
