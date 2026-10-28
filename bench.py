@@ -14,18 +14,28 @@ import unicodedata
 from pathlib import Path
 
 from models import Client, load_models, make_client
-from rag_agent import ROOT, Chunk, MarkdownRetriever, RAGAgent, ToolAgent, load_settings, parse_sections
+from rag_agent import ROOT, Chunk, MarkdownRetriever, QueryRouter, RAGAgent, ToolAgent, load_settings, parse_sections
 
 CONDITIONS = ("closed", "rag", "rag_extract", "oracle", "agent")
 TYPES = ("exact", "paraphrase", "multihop", "update", "direct", "unanswerable", "injection")
 
 
 def load_cases(path: str | Path, chunks: list[Chunk]) -> list[dict]:
-    """採点できないケース(必須の語も、含まれてはいけない語もなく、答えのない問いでもない)は、推論の前に止める。"""
+    """書き間違い(項目の欠け、IDの重複、ルーターの判定との食い違い)と、採点できないケース
+    (必須の語も、含まれてはいけない語もなく、答えのない問いでもない)は、推論の前に止める。"""
     cases = json.loads(Path(path).read_text(encoding="utf-8"))
     ids = {c.id for c in chunks}
-    errors = []
-    for c in cases:
+    router = QueryRouter()
+    errors, seen = [], set()
+    for i, c in enumerate(cases, 1):
+        if missing := [k for k in ("id", "type", "query", "route") if k not in c]:
+            errors.append(f"{c.get('id', f'{i}番目')}: {', '.join(missing)} がありません")
+            continue
+        if c["id"] in seen:
+            errors.append(f"{c['id']}: IDが重複しています")
+        seen.add(c["id"])
+        if (r := router.route(c["query"])) != c["route"]:
+            errors.append(f"{c['id']}: route は {c['route']} ですが、ルーターは {r} と判定します")
         if c["type"] not in TYPES:
             errors.append(f"{c['id']}: type は {' / '.join(TYPES)} のどれか")
         if not (c.get("keywords") or c.get("forbidden") or c["type"] == "unanswerable"):
@@ -100,6 +110,14 @@ def run_header(settings: dict, clients: list[Client], cases_path: str | Path, co
     }
 
 
+def warmup(client: Client) -> dict:
+    """JSONLに残す、予備の生成の行。失敗しても止めない(本番の問いでエラーとして数える)。"""
+    try:
+        return {"kind": "warmup", "model": client.spec.name, "ms": client.warmup(), "error": None}
+    except RuntimeError as e:
+        return {"kind": "warmup", "model": client.spec.name, "ms": None, "error": str(e)}
+
+
 def run(client: Client, condition: str, chunks: list[Chunk], cases: list[dict], settings: dict, log=None) -> list[dict]:
     agent = RAGAgent(chunks, client, settings, extract=condition == "rag_extract")
     tool_agent = ToolAgent(chunks, client, settings) if condition == "agent" else None
@@ -167,7 +185,7 @@ def context_warning(client: Client, rows: list[dict]) -> str | None:
 
 
 def agent_summary(rows: list[dict], cases: list[dict]) -> dict:
-    """条件 agent だけの、検索の判断の指標。検索の再現率は、表の前の rag の Hit@k と比べる。
+    """条件 agent だけの、検索の判断の指標。検索の再現率は、表の前の rag の All@k(正解の節がすべて入った割合)と比べる。
     エラーの問いは、検索の結果がないので外す(件数は表の「エラー」に出る)。"""
     rows = [r for r in rows if not r["error"]]
     gold = {c["id"]: c.get("gold", []) for c in cases}
@@ -187,18 +205,29 @@ def context_cell(row: dict) -> str:
     return ",".join(row["chunk_ids"]) or "-"
 
 
-def retrieval_premise(chunks: list[Chunk], cases: list[dict], k: int) -> str:
-    """検索の指標はモデルによって変わらないので、表の前に1回だけ出す。"""
+def retrieval_metrics(chunks: list[Chunk], cases: list[dict], k: int) -> dict:
+    """正解の節がある問いについて、Hit@k(どれかが上位k件)、Recall@k(上位k件に入った割合)、
+    All@k(すべてが上位k件。multihop で rag が答えられる上限)、MRR(最初の正解の順位の逆数)。"""
     retriever = MarkdownRetriever(chunks)
-    hit, rr = [], []
+    hit, recall, all_, rr = [], [], [], []
     for c in cases:
         if not c.get("gold"):
             continue
         ids = [ch.id for ch, _ in retriever.search(c["query"])]
         ranks = [ids.index(g) + 1 for g in c["gold"]]
-        hit.append(max(ranks) <= k)  # 正解の節がすべて上位k件に入ったか
+        hit.append(min(ranks) <= k)
+        recall.append(sum(r <= k for r in ranks) / len(ranks))
+        all_.append(max(ranks) <= k)
         rr.append(1 / min(ranks))
-    return f"検索の前提(BM25、上位{k}件、{len(hit)}問): Hit@{k} {statistics.fmean(hit):.2f} / MRR {statistics.fmean(rr):.2f}"
+    f = statistics.fmean
+    return {"n": len(hit), f"Hit@{k}": f(hit), f"Recall@{k}": f(recall), f"All@{k}": f(all_), "MRR": f(rr)}
+
+
+def retrieval_premise(chunks: list[Chunk], cases: list[dict], k: int) -> str:
+    """検索の指標はモデルによって変わらないので、表の前に1回だけ出す。"""
+    m = retrieval_metrics(chunks, cases, k)
+    n = m.pop("n")
+    return f"検索の前提(BM25、上位{k}件、{n}問): " + " / ".join(f"{name} {v:.2f}" for name, v in m.items())
 
 
 def table(header: list[str], rows: list[list]) -> str:
@@ -213,6 +242,7 @@ def main() -> None:
     p.add_argument("--conditions", help=f"カンマ区切りで {' / '.join(CONDITIONS)}。省略時は settings.toml の値")
     p.add_argument("--check", action="store_true", help="モデルが入っているかを確かめるだけ")
     p.add_argument("--detail", action="store_true", help="1問ごとの結果も出す")
+    p.add_argument("--no-warmup", action="store_true", help="モデルごとの予備の生成(読み込みを生成msから外す)をしない")
     p.add_argument("--cases", help="試験のファイル(例: cases_dev.json)。省略時は settings.toml の bench.cases")
     p.add_argument("--settings", default=ROOT / "settings.toml")
     p.add_argument("--models-file", default=ROOT / "models.toml")
@@ -262,14 +292,26 @@ def main() -> None:
     out.parent.mkdir(exist_ok=True)
     with out.open("w", encoding="utf-8") as log:
         log.write(json.dumps(run_header(settings, clients, cases_path, conditions), ensure_ascii=False) + "\n")
-        results = [(c, cond, run(c, cond, chunks, cases, settings, log)) for c, cond in pairs]
+        results = []
+        for c in clients:
+            todo = [cond for x, cond in pairs if x is c]
+            if not todo:
+                continue
+            # 全モデルを先に読み込むと、メモリの都合で追い出されることがあるので、そのモデルを回す直前に読み込む
+            if not args.no_warmup:
+                w = warmup(c)
+                log.write(json.dumps(w, ensure_ascii=False) + "\n")
+                print(f"{c.spec.name}: 予備の生成 " + (f"{w['ms']:.0f}ms" if w["ms"] is not None else f"失敗: {w['error']}"),
+                      file=sys.stderr)
+            results += [(c, cond, run(c, cond, chunks, cases, settings, log)) for cond in todo]
     if not results:
         sys.exit("評価できる組み合わせがありません")
 
     print(retrieval_premise(chunks, cases, settings["retrieval"]["top_k"]) + "\n")
     summaries = [(c.spec.name, cond, summarize(rows)) for c, cond, rows in results]
     print(table(["モデル", "条件", *summaries[0][2]], [[m, cond, *s.values()] for m, cond, s in summaries]))
-    print(f"\n生成msは「平均 / 最大」。切断・エラーは件数で、エラーの問いは指標から外しています。"
+    note = "(予備の生成なし。1問目に読み込みの時間を含む)" if args.no_warmup else ""
+    print(f"\n生成msは「平均 / 最大」{note}。切断・エラーは件数で、エラーの問いは指標から外しています。"
           f"生の結果: {out.relative_to(ROOT).as_posix()}")
     for c in clients:
         if w := context_warning(c, [r for client, _, rows in results if client is c for r in rows]):

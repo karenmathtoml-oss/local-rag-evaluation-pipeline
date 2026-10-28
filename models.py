@@ -48,6 +48,7 @@ class ChatTurn:
     output_tokens: int | None = None
     thinking: str | None = None  # <think> の中身と、サーバが別に返した思考。採点には使わない
     truncated: bool = False  # 上限のトークン数で切れた(done_reason が length か、<think> が閉じていない)
+    timings_ms: dict = field(default_factory=dict)  # サーバが測った時間(Ollamaだけ)。eval_ms と output_tokens でトークン/秒が出せる
 
 
 def load_models(path: str | Path) -> list[ModelSpec]:
@@ -115,8 +116,17 @@ class Client:
         """回答、生成ms、メタ情報(stop、prompt_tokens、output_tokens、thinking、truncated)を返す。"""
         turn = self.chat([{"role": "user", "content": prompt}])
         meta = {"stop": turn.done_reason, "prompt_tokens": turn.prompt_tokens, "output_tokens": turn.output_tokens,
-                "thinking": turn.thinking, "truncated": turn.truncated}
+                "thinking": turn.thinking, "truncated": turn.truncated, **turn.timings_ms}
         return turn.content, turn.ms, meta
+
+    def warmup(self) -> float:
+        """モデルをサーバに読み込ませる(1トークンだけ生成し、採点しない)。かかったmsを返す。
+        読み込みの時間が、1問目の生成msに入らないようにするため。"""
+        gen, self.gen = self.gen, {**self.gen, "max_tokens": 1}
+        try:
+            return self.generate("こんにちは")[1]
+        finally:
+            self.gen = gen
 
     def _chat(self, messages: list[dict], tools: list[dict] | None) -> ChatTurn:
         raise NotImplementedError
@@ -154,7 +164,9 @@ class OllamaClient(Client):
         if m.get("tool_calls"):
             message["tool_calls"] = m["tool_calls"]
         return ChatTurn(m.get("content") or "", calls, r.get("done_reason"), r.get("prompt_eval_count"), message,
-                        output_tokens=r.get("eval_count"), thinking=m.get("thinking"))  # think = true のとき、思考は content と別に返る
+                        output_tokens=r.get("eval_count"), thinking=m.get("thinking"),  # think = true のとき、思考は content と別に返る
+                        timings_ms={f"{k}_ms": r[f"{k}_duration"] / 1e6  # ナノ秒をミリ秒に
+                                    for k in ("load", "prompt_eval", "eval") if f"{k}_duration" in r})
 
     def tool_message(self, call: ToolCall, content: str) -> dict:
         return {"role": "tool", "tool_name": call.name, "content": content}
