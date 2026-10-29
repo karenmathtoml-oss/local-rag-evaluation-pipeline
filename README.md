@@ -144,7 +144,7 @@ python bench.py --cases cases_dev.json --models qwen3-1.7b --conditions rag,orac
 
 ## 評価結果(例)
 
-Ryzen 7 5000シリーズ、メモリ16GB、Windows。Ollama 0.40.11、モデルは3つとも Q4_K_M の量子化(`qwen3:1.7b`は2.0B、`gemma3:1b`は1.0B、`llama3.2:3b`は3.2B)。
+Ryzen 7 5000シリーズ、メモリ16GB、CPUのみ(GPUは使っていない)、Windows。Ollama 0.40.11、モデルは3つとも Q4_K_M の量子化(`qwen3:1.7b`は2.0B、`gemma3:1b`は1.0B、`llama3.2:3b`は3.2B)。
 `top_k = 3`、`tau = 0`、`num_ctx = 8192`、temperature 0、seed 42。本番の試験28問を1回ずつ。
 
 検索の前提(BM25、上位3件、21問): Hit@3 0.86 / Recall@3 0.81 / All@3 0.76 / MRR 0.74
